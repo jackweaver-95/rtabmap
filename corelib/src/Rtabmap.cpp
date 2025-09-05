@@ -109,6 +109,7 @@ Rtabmap::Rtabmap() :
 	_verifyLoopClosureHypothesis(Parameters::defaultVhEpEnabled()),
 	_maxRetrieved(Parameters::defaultRtabmapMaxRetrieved()),
 	_maxLocalRetrieved(Parameters::defaultRGBDMaxLocalRetrieved()),
+	_globalReactivationLimit(5), // Default: allow 5 nodes LTM->WM per iteration
 	_maxRepublished(Parameters::defaultRtabmapMaxRepublished()),
 	_rawDataKept(Parameters::defaultMemImageKept()),
 	_statisticLogsBufferedInRAM(Parameters::defaultRtabmapStatisticLogsBufferedInRAM()),
@@ -183,6 +184,7 @@ Rtabmap::Rtabmap() :
 	,_python(new PythonInterface())
 #endif
 {
+	ULOGGER_WARN("RTAB-Map constructor called - CUSTOM BUILD ACTIVE!");
 }
 
 Rtabmap::~Rtabmap() {
@@ -577,6 +579,12 @@ void Rtabmap::parseParameters(const ParametersMap & parameters)
 	Parameters::parse(parameters, Parameters::kVhEpEnabled(), _verifyLoopClosureHypothesis);
 	Parameters::parse(parameters, Parameters::kRtabmapMaxRetrieved(), _maxRetrieved);
 	Parameters::parse(parameters, Parameters::kRGBDMaxLocalRetrieved(), _maxLocalRetrieved);
+	// Parse custom global reactivation limit parameter
+	ParametersMap::const_iterator globalReactivationIter = parameters.find("Rtabmap/GlobalReactivationLimit");
+	if(globalReactivationIter != parameters.end())
+	{
+		_globalReactivationLimit = (unsigned int)std::atoi(globalReactivationIter->second.c_str());
+	}
 	Parameters::parse(parameters, Parameters::kRtabmapMaxRepublished(), _maxRepublished);
 	if(_maxRepublished == 0 || !_publishLastSignatureData)
 	{
@@ -1177,14 +1185,14 @@ public:
 //============================================================
 // MAIN LOOP
 //============================================================
-bool Rtabmap::process(
+int Rtabmap::process(
 		const cv::Mat & image,
 		int id,
 		const std::map<std::string, float> & externalStats)
 {
 	return this->process(SensorData(image, id), Transform());
 }
-bool Rtabmap::process(
+int Rtabmap::process(
 			const SensorData & data,
 			Transform odomPose,
 			float odomLinearVariance,
@@ -1206,13 +1214,15 @@ bool Rtabmap::process(
 	covariance.at<double>(5,5) = odomAngularVariance;
 	return process(data, odomPose, covariance, odomVelocity, externalStats);
 }
-bool Rtabmap::process(
+int Rtabmap::process(
 		const SensorData & data,
 		Transform odomPose,
 		const cv::Mat & odomCovariance,
 		const std::vector<float> & odomVelocity,
 		const std::map<std::string, float> & externalStats)
 {
+	// Marker to validate custom build is loaded (use high-severity to ensure visibility)
+	UERROR("[RTAB-Map] CUSTOM BUILD MARKER: process() entered");
 	UDEBUG("");
 
 	//============================================================
@@ -1274,7 +1284,7 @@ bool Rtabmap::process(
 	//============================================================
 	// Wait for an image...
 	//============================================================
-	ULOGGER_INFO("getting data...");
+	ULOGGER_INFO("getting data... [CUSTOM BUILD]");
 
 	timer.start();
 	timerTotal.start();
@@ -1407,7 +1417,7 @@ bool Rtabmap::process(
 			{
 				UERROR("RGB-D SLAM mode is enabled, memory is incremental but no odometry is provided. "
 					   "Image %d is ignored!", data.id());
-				return false;
+				return 0;
 			}
 			else // fake localization
 			{
@@ -1468,14 +1478,14 @@ bool Rtabmap::process(
 	{
 		if(!_memory->update(data, odomPose, odomCovariance, odomVelocity, &statistics_))
 		{
-			return false;
+			return 0;
 		}
 	}
 	else
 	{
 		if(!_memory->update(data, Transform(), cv::Mat(), std::vector<float>(), &statistics_))
 		{
-			return false;
+			return 0;
 		}
 	}
 
@@ -2580,11 +2590,100 @@ bool Rtabmap::process(
 	//============================================================
 	if(reactivatedIds.size())
 	{
+		// In localization mode, bypass global reactivation limits to allow proper startup
+		if(!_memory->isIncremental())
+		{
+			UINFO("Localization mode: bypassing GlobalReactivationLimit (%d nodes requested)", (int)reactivatedIds.size());
+		}
+		// If globally disabled and in mapping mode, skip any reactivation entirely
+		else if(_globalReactivationLimit == 0)
+		{
+			UINFO("Global reactivation disabled (GlobalReactivationLimit=0). Skipping all LTM->WM reactivations.");
+			reactivatedIds.clear();
+		}
+
+		// Apply global reactivation budget limit with priority ranking
+		if(_globalReactivationLimit > 0 && reactivatedIds.size() > _globalReactivationLimit)
+		{
+			UINFO("Global reactivation budget: ranking and limiting %d nodes to %d (budget=%d)", 
+				  (int)reactivatedIds.size(), _globalReactivationLimit, _globalReactivationLimit);
+			
+			// Priority ranking for node selection:
+			// 1. Path nodes (retrievalLocalIds) - highest priority for navigation
+			// 2. Direct loop closure hypothesis - critical for loop closure validation  
+			// 3. Loop closure neighbors (by time proximity, then space proximity)
+			// 4. Other retrieval candidates
+			
+			std::list<int> prioritizedIds;
+			std::set<int> localIdsSet(retrievalLocalIds.begin(), retrievalLocalIds.end());
+			
+			// Priority 1: Path nodes (already at front, preserve them)
+			for(std::list<int>::iterator iter = reactivatedIds.begin(); 
+				iter != reactivatedIds.end() && prioritizedIds.size() < _globalReactivationLimit; 
+				++iter)
+			{
+				if(localIdsSet.find(*iter) != localIdsSet.end())
+				{
+					prioritizedIds.push_back(*iter);
+				}
+			}
+			
+			// Priority 2: Direct loop closure hypothesis
+			if(prioritizedIds.size() < _globalReactivationLimit && retrievalId > 0)
+			{
+				bool found = false;
+				for(std::list<int>::iterator iter = reactivatedIds.begin(); iter != reactivatedIds.end() && !found; ++iter)
+				{
+					if(*iter == retrievalId && localIdsSet.find(*iter) == localIdsSet.end())
+					{
+						prioritizedIds.push_back(*iter);
+						found = true;
+					}
+				}
+			}
+			
+			// Priority 3: Remaining nodes (preserve original order - time neighbors first, then space neighbors)
+			for(std::list<int>::iterator iter = reactivatedIds.begin(); 
+				iter != reactivatedIds.end() && prioritizedIds.size() < _globalReactivationLimit; 
+				++iter)
+			{
+				if(localIdsSet.find(*iter) == localIdsSet.end() && *iter != retrievalId)
+				{
+					prioritizedIds.push_back(*iter);
+				}
+			}
+			
+			reactivatedIds = prioritizedIds;
+			UINFO("Budget applied: %d path nodes, %d loop closure nodes selected", 
+				  (int)std::min(localIdsSet.size(), (size_t)_globalReactivationLimit),
+				  (int)(reactivatedIds.size() - std::min(localIdsSet.size(), (size_t)_globalReactivationLimit)));
+		}
+		
 		// Not important if the loop closure hypothesis don't have all its neighbors loaded,
 		// only a loop closure link is added...
+		// Enforce a hard cap on how many we allow to load this iteration (bypass in localization mode)
+		unsigned int requestedMaxLoaded = _maxRetrieved + (unsigned int)retrievalLocalIds.size();
+		unsigned int hardCap;
+		unsigned int effectiveMaxLoaded;
+		
+		if(!_memory->isIncremental())
+		{
+			// Localization mode: no global limit, use original logic
+			hardCap = (unsigned int)reactivatedIds.size();
+			effectiveMaxLoaded = requestedMaxLoaded;
+		}
+		else
+		{
+			// Mapping mode: apply global reactivation limit
+			hardCap = _globalReactivationLimit > 0 ? (unsigned int)std::min<size_t>(_globalReactivationLimit, reactivatedIds.size()) : (unsigned int)reactivatedIds.size();
+			effectiveMaxLoaded = std::min(requestedMaxLoaded, hardCap);
+		}
+		
+		UINFO("Reactivation request: ids=%d, requestedMaxLoaded=%u, hardCap=%u, effectiveMaxLoaded=%u (incremental=%s)", 
+			  (int)reactivatedIds.size(), requestedMaxLoaded, hardCap, effectiveMaxLoaded, _memory->isIncremental()?"true":"false");
 		signaturesRetrieved = _memory->reactivateSignatures(
 				reactivatedIds,
-				_maxRetrieved+(unsigned int)retrievalLocalIds.size(), // add path retrieved
+				effectiveMaxLoaded,
 				timeRetrievalDbAccess);
 
 		ULOGGER_INFO("retrieval of %d (db time = %fs)", (int)signaturesRetrieved.size(), timeRetrievalDbAccess);
@@ -4762,7 +4861,7 @@ bool Rtabmap::process(
 		statistics_.addStatistic(Statistics::kTimingFinalizing_statistics(), timeFinalizingStatistics*1000);
 	}
 
-	return true;
+	return 42; // Custom build marker!
 }
 
 // SETTERS

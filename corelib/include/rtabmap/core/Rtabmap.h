@@ -66,16 +66,16 @@ public:
 	 * @param odomPose Odometry pose, should be non-null for RGB-D SLAM mode.
 	 * @param covariance Odometry covariance.
 	 * @param externalStats External statistics to be saved in the database for convenience
-	 * @return true if data has been added to map.
+	 * @return Custom build marker (42) if data has been added to map, 0 if not processed.
 	 */
-	bool process(
+	int process(
 			const SensorData & data,
 			Transform odomPose,
 			const cv::Mat & odomCovariance = cv::Mat::eye(6,6,CV_64FC1),
 			const std::vector<float> & odomVelocity = std::vector<float>(),
 			const std::map<std::string, float> & externalStats = std::map<std::string, float>());
 	// for convenience
-	bool process(
+	int process(
 			const SensorData & data,
 			Transform odomPose,
 			float odomLinearVariance,
@@ -83,7 +83,7 @@ public:
 			const std::vector<float> & odomVelocity = std::vector<float>(),
 			const std::map<std::string, float> & externalStats = std::map<std::string, float>());
 	// for convenience, loop closure detection only
-	bool process(
+	int process(
 			const cv::Mat & image,
 			int id=0, const std::map<std::string, float> & externalStats = std::map<std::string, float>());
 
@@ -290,6 +290,7 @@ private:
 	bool _verifyLoopClosureHypothesis;
 	unsigned int _maxRetrieved;
 	unsigned int _maxLocalRetrieved;
+	unsigned int _globalReactivationLimit;
 	unsigned int _maxRepublished;
 	bool _rawDataKept;
 	bool _statisticLogsBufferedInRAM;
