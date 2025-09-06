@@ -121,7 +121,23 @@ void Signature::addLink(const Link & link)
 	//UDEBUG("Add link %d to %d (type=%d/%s var=%f,%f)", link.to(), this->id(), (int)link.type(), link.typeName().c_str(), link.transVariance(), link.rotVariance());
 	UASSERT_MSG(link.from() == this->id(), uFormat("%d->%d for signature %d (type=%d)", link.from(), link.to(), this->id(), link.type()).c_str());
 	UASSERT_MSG((link.to() != this->id()) || link.type()==Link::kPosePrior || link.type()==Link::kGravity, uFormat("%d->%d for signature %d (type=%d)", link.from(), link.to(), this->id(), link.type()).c_str());
-	UASSERT_MSG(link.to() == this->id() || _links.find(link.to()) == _links.end(), uFormat("Link %d (type=%d) already added to signature %d!", link.to(), link.type(), this->id()).c_str());
+	// If a link to the same target and of the same type already exists,
+	// update it instead of asserting. Localization mode may attempt to add
+	// the same link again after internal refreshes.
+	if(link.to() != this->id())
+	{
+		std::pair<std::multimap<int, Link>::iterator, std::multimap<int, Link>::iterator> range = _links.equal_range(link.to());
+		for(std::multimap<int, Link>::iterator iter = range.first; iter != range.second; ++iter)
+		{
+			if(iter->second.type() == link.type())
+			{
+				iter->second = link;
+				_linksModified = true;
+				return;
+			}
+		}
+	}
+	
 	_links.insert(std::make_pair(link.to(), link));
 	_linksModified = true;
 }

@@ -4646,48 +4646,116 @@ int Rtabmap::process(
 	_lastProcessTime = totalTime;
 	timing.transfer_ms = sectionTimer.ticks() * 1000.0;
 	//============================================================
-	// GlobalWMLimit enforcement
+	// GlobalWMLimit enforcement with spatially-aware random deletion
 	//============================================================
 	sectionTimer.start();
 	double timeGlobalWMLimit = 0.0;
 	timer.start();
-	// If GlobalWMLimit is set and WM exceeds the limit, transfer oldest nodes to LTM
+	// If GlobalWMLimit is set and WM exceeds the limit, transfer nodes to LTM using spatial random selection
 	if(_globalWMLimit > 0 && _memory->getWorkingMem().size() > _globalWMLimit)
 	{
-		ULOGGER_INFO("Working memory size (%d) exceeds GlobalWMLimit (%d), transferring oldest nodes to LTM...", 
+		ULOGGER_INFO("Working memory size (%d) exceeds GlobalWMLimit (%d), transferring spatially-random nodes to LTM...", 
 			(int)_memory->getWorkingMem().size(), _globalWMLimit);
 		
-		// No immunization for GlobalWMLimit - transfer ANY nodes to enforce hard limit
-		std::set<int> immunizedForWMLimit; // Empty set = no immunization
+		// CUSTOM: Spatially-aware random immunization for GlobalWMLimit
+		std::set<int> immunizedForWMLimit;
 		
-		// Calculate how many nodes need to be transferred
-		int nodesToTransfer = (int)_memory->getWorkingMem().size() - _globalWMLimit;
+		// Step 1: Always immunize critical nodes to maintain connectivity
+		if(_lastLocalizationNodeId > 0) {
+			immunizedForWMLimit.insert(_lastLocalizationNodeId);
+		}
+		if(_memory->getLastWorkingSignature()) {
+			immunizedForWMLimit.insert(_memory->getLastWorkingSignature()->id());
+		}
+		// Immunize recent loop closure nodes
+		if(_loopClosureHypothesis.first > 0) {
+			immunizedForWMLimit.insert(_loopClosureHypothesis.first);
+		}
+		// Immunize path nodes if any
+		for(unsigned int i = 0; i < _path.size() && i < 5; ++i) { // immunize up to 5 path nodes
+			immunizedForWMLimit.insert(_path[i].first);
+		}
 		
-		// Transfer oldest nodes until we're at or below the limit
-		while(_memory->getWorkingMem().size() > _globalWMLimit && nodesToTransfer > 0)
+		// Step 2: Build candidate list for random selection (exclude immunized and recent STM)
+		std::vector<int> candidatesForRemoval;
+		const std::set<int> & stm = _memory->getStMem();
+		for(std::map<int, double>::const_iterator iter = _memory->getWorkingMem().begin(); 
+			iter != _memory->getWorkingMem().end(); ++iter)
 		{
-			std::list<int> transferred = _memory->forget(immunizedForWMLimit);
+			if(iter->first > 0 && // valid node
+			   immunizedForWMLimit.find(iter->first) == immunizedForWMLimit.end() && // not immunized
+			   stm.find(iter->first) == stm.end()) // not in STM (too recent)
+			{
+				candidatesForRemoval.push_back(iter->first);
+			}
+		}
+		
+		ULOGGER_INFO("GlobalWMLimit: %d candidates for removal, %d immunized", 
+			(int)candidatesForRemoval.size(), (int)immunizedForWMLimit.size());
+		
+		// Step 3: Random shuffle for spatial distribution
+		if(!candidatesForRemoval.empty())
+		{
+			// Use current signature ID as seed for deterministic randomness
+			std::srand(signature ? signature->id() : (unsigned int)std::time(nullptr));
+			std::random_shuffle(candidatesForRemoval.begin(), candidatesForRemoval.end());
+		}
+		
+		// Step 4: Transfer nodes using random order (Memory::forget will handle link cleanup)
+		int nodesToTransfer = (int)_memory->getWorkingMem().size() - _globalWMLimit;
+		int candidatesUsed = 0;
+		
+		while(_memory->getWorkingMem().size() > _globalWMLimit && nodesToTransfer > 0 && candidatesUsed < (int)candidatesForRemoval.size())
+		{
+			// Build immunization set: keep all except next random candidate
+			std::set<int> immunizeAllExceptCandidate;
+			for(std::map<int, double>::const_iterator iter = _memory->getWorkingMem().begin(); 
+				iter != _memory->getWorkingMem().end(); ++iter)
+			{
+				if(iter->first != candidatesForRemoval[candidatesUsed])
+				{
+					immunizeAllExceptCandidate.insert(iter->first);
+				}
+			}
+			
+			std::list<int> transferred = _memory->forget(immunizeAllExceptCandidate);
 			if(transferred.empty())
 			{
-				// No more nodes can be transferred (should not happen with empty immunization)
-				ULOGGER_WARN("Cannot transfer any more nodes from WM (size=%d) - this should not happen with GlobalWMLimit", 
-					(int)_memory->getWorkingMem().size());
-				break;
+				ULOGGER_WARN("Cannot transfer candidate %d from WM (may be connected to STM)", candidatesForRemoval[candidatesUsed]);
+				candidatesUsed++;
+				continue;
 			}
 			
 			signaturesRemoved.insert(signaturesRemoved.end(), transferred.begin(), transferred.end());
 			nodesToTransfer -= (int)transferred.size();
+			candidatesUsed++;
 			
 			if(!_someNodesHaveBeenTransferred && transferred.size())
 			{
 				_someNodesHaveBeenTransferred = true;
 			}
 			
-			ULOGGER_DEBUG("Transferred %d nodes to LTM, WM size now: %d", 
+			ULOGGER_DEBUG("Randomly transferred %d nodes to LTM, WM size now: %d", 
 				(int)transferred.size(), (int)_memory->getWorkingMem().size());
 		}
 		
-		ULOGGER_INFO("GlobalWMLimit enforcement complete. Final WM size: %d", (int)_memory->getWorkingMem().size());
+		// Fallback: if random selection didn't transfer enough, use original method
+		if(_memory->getWorkingMem().size() > _globalWMLimit)
+		{
+			ULOGGER_WARN("Random selection insufficient, falling back to oldest-first deletion");
+			std::set<int> emptyImmunization; // No immunization for fallback
+			while(_memory->getWorkingMem().size() > _globalWMLimit && nodesToTransfer > 0)
+			{
+				std::list<int> transferred = _memory->forget(emptyImmunization);
+				if(transferred.empty()) break;
+				
+				signaturesRemoved.insert(signaturesRemoved.end(), transferred.begin(), transferred.end());
+				nodesToTransfer -= (int)transferred.size();
+			}
+		}
+		
+		ULOGGER_INFO("GlobalWMLimit enforcement complete. Final WM size: %d (used %d random candidates)", 
+			(int)_memory->getWorkingMem().size(), candidatesUsed);
 	}
 	timeGlobalWMLimit = timer.ticks();
 	ULOGGER_INFO("timeGlobalWMLimit=%fs", timeGlobalWMLimit);
@@ -4716,19 +4784,19 @@ int Rtabmap::process(
 				id = _path.at(_pathCurrentIndex).first;
 				UDEBUG("Refresh local map from %d", id);
 			}
+		else
+		{
+			if(uContains(_optimizedPoses, _lastLocalizationNodeId) && _memory->getSignature(_lastLocalizationNodeId) != 0)
+			{
+				id = _lastLocalizationNodeId;
+				UDEBUG("Refresh local map from %d", id);
+			}
 			else
 			{
-				if(uContains(_optimizedPoses, _lastLocalizationNodeId))
-				{
-					id = _lastLocalizationNodeId;
-					UDEBUG("Refresh local map from %d", id);
-				}
-				else
-				{
-					UDEBUG("Clearing _lastLocalizationNodeId(%d)", _lastLocalizationNodeId);
-					_lastLocalizationNodeId = 0;
-				}
+				UDEBUG("Clearing _lastLocalizationNodeId(%d) - not in optimized poses or signature removed", _lastLocalizationNodeId);
+				_lastLocalizationNodeId = 0;
 			}
+		}
 		}
 		else if(_memory->isIncremental() &&
 				_optimizedPoses.size() &&
@@ -4938,6 +5006,15 @@ int Rtabmap::process(
 		statistics_.setConstraints(constraints);
 
 		statistics_.addStatistic(Statistics::kMemoryLocal_graph_size(), poses.size());
+		
+		// CUSTOM: Add connected component size (nodes reachable from current position)
+		int connectedComponentSize = 0;
+		if(_memory && _memory->getLastWorkingSignature())
+		{
+			std::map<int, int> connectedIds = _memory->getNeighborsId(_memory->getLastWorkingSignature()->id(), 0, 0, true);
+			connectedComponentSize = (int)connectedIds.size();
+		}
+		statistics_.addStatistic("Memory/ConnectedGraphSize", (float)connectedComponentSize);
 
 		statistics_.setOdomCachePoses(_odomCachePoses);
 		statistics_.setOdomCacheConstraints(_odomCacheConstraints);
