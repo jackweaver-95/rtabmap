@@ -88,6 +88,21 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 //
 
+// Minimal async reactivation scaffold
+#include <deque>
+#include <set>
+#include <mutex>
+#include <thread>
+#include <chrono>
+
+namespace {
+static std::deque<int> g_bgReactQueue;           // pending ids to reactivate across frames
+static std::set<int>   g_bgReactQueued;          // dedup set
+static std::mutex      g_bgReactMutex;           // protects both above
+static std::mutex      g_reactivationMutex;      // serializes Memory::reactivateSignatures (not thread-safe)
+static unsigned int g_bgReactQueueMax = 256; // bounded size (tunable)
+}
+
 namespace rtabmap
 {
 
@@ -110,6 +125,7 @@ Rtabmap::Rtabmap() :
 	_maxRetrieved(Parameters::defaultRtabmapMaxRetrieved()),
 	_maxLocalRetrieved(Parameters::defaultRGBDMaxLocalRetrieved()),
 	_globalReactivationLimit(5), // Default: allow 5 nodes LTM->WM per iteration
+	_globalWMLimit(0), // Default: 0 = no limit on WM size
 	_maxRepublished(Parameters::defaultRtabmapMaxRepublished()),
 	_rawDataKept(Parameters::defaultMemImageKept()),
 	_statisticLogsBufferedInRAM(Parameters::defaultRtabmapStatisticLogsBufferedInRAM()),
@@ -179,12 +195,22 @@ Rtabmap::Rtabmap() :
 	_pathGoalIndex(0),
 	_pathTransformToGoal(Transform::getIdentity()),
 	_pathStuckCount(0),
-	_pathStuckDistance(0.0f)
+	_pathStuckDistance(0.0f),
+	_totalFramesProcessed(0),
+	_totalFramesRehearsed(0)
 #ifdef RTABMAP_PYTHON
 	,_python(new PythonInterface())
 #endif
 {
 	ULOGGER_WARN("RTAB-Map constructor called - CUSTOM BUILD ACTIVE!");
+	// Initialize async reactivation controls
+	_bgReactEnabled = true;
+	_bgReactSlice = 4;
+	_bgReactIdleMs = 10;
+	_bgReactThread = 0;
+	_bgReactStop = false;
+	_isProcessing = false;
+	_bgReactBudget = 0;
 }
 
 Rtabmap::~Rtabmap() {
@@ -374,6 +400,22 @@ void Rtabmap::init(const ParametersMap & parameters, const std::string & databas
 	// Parse all parameters
 	this->parseParameters(allParameters);
 
+	// Always clear background reactivation queues on init to avoid stale IDs across sessions
+	{
+		std::lock_guard<std::mutex> lock(g_bgReactMutex);
+		g_bgReactQueue.clear();
+		g_bgReactQueued.clear();
+	}
+	_bgReactBudget.store(0);
+
+	// Start background reactivation worker if enabled
+	if(_bgReactEnabled && _bgReactThread == 0)
+	{
+		_bgReactStop = false;
+		_bgReactThread = new std::thread(&Rtabmap::bgReactWorker, this);
+		UINFO("Background reactivation worker started");
+	}
+
 	Transform lastPose;
 	_optimizedPoses = _memory->loadOptimizedPoses(&lastPose);
 	if(!_memory->isIncremental())
@@ -490,6 +532,24 @@ void Rtabmap::close(bool databaseSaved, const std::string & ouputDatabasePath)
 
 	_nodesToRepublish.clear();
 
+	// Stop background reactivation worker FIRST (before deleting memory)
+	if(_bgReactThread)
+	{
+		_bgReactStop = true;
+		_bgReactThread->join();
+		delete _bgReactThread;
+		_bgReactThread = 0;
+		UINFO("Background reactivation worker stopped");
+	}
+
+	// Clear any remaining background reactivation state on close
+	{
+		std::lock_guard<std::mutex> lock(g_bgReactMutex);
+		g_bgReactQueue.clear();
+		g_bgReactQueued.clear();
+	}
+	_bgReactBudget.store(0);
+
 	flushStatisticLogs();
 	if(_foutFloat)
 	{
@@ -544,7 +604,6 @@ void Rtabmap::close(bool databaseSaved, const std::string & ouputDatabasePath)
 	parseParameters(Parameters::getDefaultParameters()); // reset to default parameters
 	_parameters.clear();
 }
-
 void Rtabmap::parseParameters(const ParametersMap & parameters)
 {
 	uInsert(_parameters, parameters);
@@ -585,14 +644,41 @@ void Rtabmap::parseParameters(const ParametersMap & parameters)
 	{
 		_globalReactivationLimit = (unsigned int)std::atoi(globalReactivationIter->second.c_str());
 	}
+	// Parse custom global WM limit parameter
+	ParametersMap::const_iterator globalWMLimitIter = parameters.find("Rtabmap/GlobalWMLimit");
+	if(globalWMLimitIter != parameters.end())
+	{
+		_globalWMLimit = (unsigned int)std::atoi(globalWMLimitIter->second.c_str());
+	}
+	// Background reactivation tuning
+	ParametersMap::const_iterator bgEnableIter = parameters.find("Rtabmap/BackgroundReactivation");
+	if(bgEnableIter != parameters.end())
+	{
+		_bgReactEnabled = (bgEnableIter->second == "true" || bgEnableIter->second == "1");
+	}
+	ParametersMap::const_iterator bgSliceIter = parameters.find("Rtabmap/BackgroundReactivationSlice");
+	if(bgSliceIter != parameters.end())
+	{
+		_bgReactSlice = (unsigned int)std::max(1, std::atoi(bgSliceIter->second.c_str()));
+	}
+	ParametersMap::const_iterator bgIdleIter = parameters.find("Rtabmap/BackgroundReactivationIdleMs");
+	if(bgIdleIter != parameters.end())
+	{
+		_bgReactIdleMs = (unsigned int)std::max(1, std::atoi(bgIdleIter->second.c_str()));
+	}
+	// Queue capacity parameter (Q)
+	ParametersMap::const_iterator bgQueueIter = parameters.find("Rtabmap/BackgroundReactivationQueueMax");
+	if(bgQueueIter != parameters.end())
+	{
+		g_bgReactQueueMax = (unsigned int)std::max(1, std::atoi(bgQueueIter->second.c_str()));
+	}
+
 	Parameters::parse(parameters, Parameters::kRtabmapMaxRepublished(), _maxRepublished);
 	if(_maxRepublished == 0 || !_publishLastSignatureData)
 	{
 		_nodesToRepublish.clear();
 	}
 	Parameters::parse(parameters, Parameters::kMemImageKept(), _rawDataKept);
-	Parameters::parse(parameters, Parameters::kRGBDEnabled(), _rgbdSlamMode);
-	Parameters::parse(parameters, Parameters::kRGBDLinearUpdate(), _rgbdLinearUpdate);
 	Parameters::parse(parameters, Parameters::kRGBDAngularUpdate(), _rgbdAngularUpdate);
 	Parameters::parse(parameters, Parameters::kRGBDLinearSpeedUpdate(), _rgbdLinearSpeedUpdate);
 	Parameters::parse(parameters, Parameters::kRGBDAngularSpeedUpdate(), _rgbdAngularSpeedUpdate);
@@ -1123,6 +1209,8 @@ void Rtabmap::resetMemory()
 	_globalScanMapPoses.clear();
 	_nodesToRepublish.clear();
 	this->clearPath(0);
+	_totalFramesProcessed = 0;
+	_totalFramesRehearsed = 0;
 
 	if(_memory)
 	{
@@ -1150,7 +1238,6 @@ void Rtabmap::resetMemory()
 
 	this->setupLogFiles(true);
 }
-
 class NearestPathKey
 {
 public:
@@ -1181,7 +1268,6 @@ public:
 	int id;
 	float distance;
 };
-
 //============================================================
 // MAIN LOOP
 //============================================================
@@ -1190,7 +1276,7 @@ int Rtabmap::process(
 		int id,
 		const std::map<std::string, float> & externalStats)
 {
-	return this->process(SensorData(image, id), Transform());
+	return process(SensorData(image, id), Transform());
 }
 int Rtabmap::process(
 			const SensorData & data,
@@ -1217,13 +1303,58 @@ int Rtabmap::process(
 int Rtabmap::process(
 		const SensorData & data,
 		Transform odomPose,
+		float odomLinearVariance,
+		float odomAngularVariance,
+		const std::vector<float> & odomVelocity,
+		const std::map<std::string, float> & externalStats,
+		ProcessTiming * customTiming)
+{
+	if(!odomPose.isNull())
+	{
+		UASSERT(odomLinearVariance>0.0f);
+		UASSERT(odomAngularVariance>0.0f);
+	}
+	cv::Mat covariance = cv::Mat::eye(6,6,CV_64FC1);
+	covariance.at<double>(0,0) = odomLinearVariance;
+	covariance.at<double>(1,1) = odomLinearVariance;
+	covariance.at<double>(2,2) = odomLinearVariance;
+	covariance.at<double>(3,3) = odomAngularVariance;
+	covariance.at<double>(4,4) = odomAngularVariance;
+	covariance.at<double>(5,5) = odomAngularVariance;
+	return process(data, odomPose, covariance, odomVelocity, externalStats, customTiming);
+}
+int Rtabmap::process(
+		const SensorData & data,
+		Transform odomPose,
 		const cv::Mat & odomCovariance,
 		const std::vector<float> & odomVelocity,
 		const std::map<std::string, float> & externalStats)
 {
+	return process(data, odomPose, odomCovariance, odomVelocity, externalStats, nullptr);
+}
+int Rtabmap::process(
+		const SensorData & data,
+		Transform odomPose,
+		const cv::Mat & odomCovariance,
+		const std::vector<float> & odomVelocity,
+		const std::map<std::string, float> & externalStats,
+		ProcessTiming * customTiming)
+{
 	// Marker to validate custom build is loaded (use high-severity to ensure visibility)
 	UERROR("[RTAB-Map] CUSTOM BUILD MARKER: process() entered");
 	UDEBUG("");
+
+	// Coordinate with background reactivation worker
+	_isProcessing = true;
+
+	//============================================================
+	// Custom timing initialization
+	//============================================================
+	UTimer customTimer;
+	UTimer sectionTimer;
+	ProcessTiming timing;
+	customTimer.start();
+	sectionTimer.start();
 
 	//============================================================
 	// Initialization
@@ -1292,6 +1423,9 @@ int Rtabmap::process(
 	UASSERT_MSG(_memory, "RTAB-Map is not initialized!");
 	UASSERT_MSG(_bayesFilter, "RTAB-Map is not initialized!");
 	UASSERT_MSG(_graphOptimizer, "RTAB-Map is not initialized!");
+
+	// Track total frames processed for rehearsal percentage calculation
+	_totalFramesProcessed++;
 
 	//============================================================
 	// If RGBD SLAM is enabled, a pose must be set.
@@ -1417,6 +1551,7 @@ int Rtabmap::process(
 			{
 				UERROR("RGB-D SLAM mode is enabled, memory is incremental but no odometry is provided. "
 					   "Image %d is ignored!", data.id());
+				_isProcessing = false;
 				return 0;
 			}
 			else // fake localization
@@ -1470,14 +1605,18 @@ int Rtabmap::process(
 		}
 	}
 
+	timing.initialization_ms = sectionTimer.ticks() * 1000.0;
+
 	//============================================================
 	// Memory Update : Location creation + Add to STM + Weight Update (Rehearsal)
 	//============================================================
+	sectionTimer.start();
 	ULOGGER_INFO("Updating memory...");
 	if(_rgbdSlamMode)
 	{
 		if(!_memory->update(data, odomPose, odomCovariance, odomVelocity, &statistics_))
 		{
+			_isProcessing = false;
 			return 0;
 		}
 	}
@@ -1485,6 +1624,7 @@ int Rtabmap::process(
 	{
 		if(!_memory->update(data, Transform(), cv::Mat(), std::vector<float>(), &statistics_))
 		{
+			_isProcessing = false;
 			return 0;
 		}
 	}
@@ -1495,14 +1635,14 @@ int Rtabmap::process(
 	{
 		UFATAL("Not supposed to be here...last signature is null?!?");
 	}
-
 	ULOGGER_INFO("Processing signature %d w=%d map=%d", signature->id(), signature->getWeight(), signature->mapId());
 	timeMemoryUpdate = timer.ticks();
 	ULOGGER_INFO("timeMemoryUpdate=%fs", timeMemoryUpdate);
-
+	timing.memory_update_ms = sectionTimer.ticks() * 1000.0;
 	//============================================================
 	// Metric
 	//============================================================
+	sectionTimer.start();
 	bool smallDisplacement = false;
 	bool tooFastMovement = false;
 	std::list<int> signaturesRemoved;
@@ -1521,6 +1661,7 @@ int Rtabmap::process(
 		int rehearsedId = (int)uValue(statistics_.data(), Statistics::kMemoryRehearsal_merged(), 0.0f);
 		if(rehearsedId > 0)
 		{
+			_totalFramesRehearsed++;
 			_optimizedPoses.erase(rehearsedId);
 		}
 		else
@@ -1543,6 +1684,7 @@ int Rtabmap::process(
 						if(signature->getWeight() < 0 || s->getWeight() >= 0)
 						{
 							t = links.begin()->second.transform();
+							
 						}
 					}
 				}
@@ -1640,6 +1782,7 @@ int Rtabmap::process(
 							for(std::map<int, Transform>::iterator iter=_optimizedPoses.begin(); iter!=_optimizedPoses.end(); ++iter)
 							{
 								iter->second = mapCorrectionInv * up * iter->second;
+								
 							}
 						}
 					}
@@ -1868,13 +2011,16 @@ int Rtabmap::process(
 			}
 		}
 
+		timing.metric_processing_ms = sectionTimer.ticks() * 1000.0;
+
 		//============================================================
 		// Local loop closure in TIME
 		//============================================================
+		sectionTimer.start();
 		if((_proximityByTime || intermediateNodeRefining) &&
-		   rehearsedId == 0 && // don't do it if rehearsal happened
-		   _memory->isIncremental() && // don't do it in localization mode
-		   signature->getWeight()>=0)
+	   rehearsedId == 0 && // don't do it if rehearsal happened
+	   _memory->isIncremental() && // don't do it in localization mode
+	   signature->getWeight()>=0)
 		{
 			const std::set<int> & stm = _memory->getStMem();
 			for(std::set<int>::const_reverse_iterator iter = stm.rbegin(); iter!=stm.rend(); ++iter)
@@ -1935,10 +2081,12 @@ int Rtabmap::process(
 
 	timeProximityByTimeDetection = timer.ticks();
 	UINFO("timeProximityByTimeDetection=%fs", timeProximityByTimeDetection);
+	timing.proximity_by_time_ms = sectionTimer.ticks() * 1000.0;
 
 	//============================================================
 	// Bayes filter update
 	//============================================================
+	sectionTimer.start();
 	bool localizationOnPreviousUpdate = false;
 	if(_memory->isIncremental())
 	{
@@ -1976,7 +2124,6 @@ int Rtabmap::process(
 
 		localizationOnPreviousUpdate = localizationLinks > 1; // need two links in case we have delayed localization
 	}
-
 	// Not a bad signature, not an intermediate node, not a small displacement unless the previous signature didn't have a loop closure, not too fast movement
 	if(!signature->isBadSignature() && signature->getWeight()>=0 && (!smallDisplacement || !localizationOnPreviousUpdate) && !tooFastMovement)
 	{
@@ -2212,7 +2359,7 @@ int Rtabmap::process(
 				hypothesisRatio = _loopClosureHypothesis.second>0?_highestHypothesis.second/_loopClosureHypothesis.second:0;
 			}
 		} // if(_memory->getWorkingMemSize())
-	}// !isBadSignature
+	}
 	else if(!signature->isBadSignature() && (smallDisplacement || tooFastMovement))
 	{
 		_highestHypothesis = lastHighestHypothesis;
@@ -2223,17 +2370,18 @@ int Rtabmap::process(
 		UDEBUG("Ignoring likelihood and loop closure hypotheses as current signature doesn't have enough visual features.");
 	}
 
-	//============================================================
-	// Before retrieval, make sure the trash has finished
-	//============================================================
+	// Before retrieval, make sure the trash has finished (include in bayes filter timing)
 	_memory->joinTrashThread();
 	timeEmptyingTrash = _memory->getDbSavingTime();
 	timeJoiningTrash = timer.ticks();
 	ULOGGER_INFO("Time emptying memory trash = %fs,  joining (actual overhead) = %fs", timeEmptyingTrash, timeJoiningTrash);
 
+	timing.bayes_filter_ms = sectionTimer.ticks() * 1000.0;
+
 	//============================================================
 	// RETRIEVAL 1/3 : Loop closure neighbors reactivation
 	//============================================================
+	sectionTimer.start();
 	int retrievalId = _highestHypothesis.first;
 	std::list<int> reactivatedIds;
 	double timeGetNeighborsTimeDb = 0.0;
@@ -2383,10 +2531,11 @@ int Rtabmap::process(
 
 		}
 	}
-
+	timing.retrieval_phase1_ms = sectionTimer.ticks() * 1000.0;
 	//============================================================
 	// RETRIEVAL 2/3 : Update planned path and get next nodes to retrieve
 	//============================================================
+	sectionTimer.start();
 	std::list<int> retrievalLocalIds;
 	if(_rgbdSlamMode)
 	{
@@ -2432,81 +2581,6 @@ int Rtabmap::process(
 		if(!(_memory->allNodesInWM() && maxLocalLocationsImmunized == 0))
 		{
 			// immunize the path from the nearest local location to the current location
-			if(immunizedLocally < maxLocalLocationsImmunized &&
-				_memory->isIncremental()) // Can only work in mapping mode
-			{
-				std::map<int ,Transform> poses;
-				// remove poses from STM
-				for(std::map<int, Transform>::iterator iter=_optimizedPoses.begin(); iter!=_optimizedPoses.end(); ++iter)
-				{
-					if(iter->first > 0 && !_memory->isInSTM(iter->first))
-					{
-						poses.insert(*iter);
-					}
-				}
-				int nearestId = graph::findNearestNode(poses, _optimizedPoses.at(signature->id()));
-
-				if(nearestId > 0 &&
-					(_localRadius==0 ||
-					 _optimizedPoses.at(signature->id()).getDistance(_optimizedPoses.at(nearestId)) < _localRadius))
-				{
-					std::multimap<int, int> links;
-					for(std::multimap<int, Link>::iterator iter=_constraints.begin(); iter!=_constraints.end(); ++iter)
-					{
-						if(uContains(_optimizedPoses, iter->second.from()) && uContains(_optimizedPoses, iter->second.to()))
-						{
-							links.insert(std::make_pair(iter->second.from(), iter->second.to()));
-							links.insert(std::make_pair(iter->second.to(), iter->second.from())); // <->
-						}
-					}
-
-					std::list<std::pair<int, Transform> > path = graph::computePath(_optimizedPoses, links, nearestId, signature->id());
-					if(path.size() == 0)
-					{
-						UWARN("Could not compute a path between %d and %d", nearestId, signature->id());
-					}
-					else
-					{
-						for(std::list<std::pair<int, Transform> >::iterator iter=path.begin();
-							iter!=path.end();
-							++iter)
-						{
-							if(iter->first>0)
-							{
-								if(immunizedLocally >= maxLocalLocationsImmunized)
-								{
-									// set 20 to avoid this warning when starting mapping
-									if(maxLocalLocationsImmunized > 20 && _someNodesHaveBeenTransferred)
-									{
-										UWARN("Could not immunize the whole local path (%d) between "
-											  "%d and %d (max location immunized=%d). You may want "
-											  "to increase RGBD/LocalImmunizationRatio (current=%f (%d of WM=%d)) "
-											  "to be able to immunize longer paths.",
-												(int)path.size(),
-												nearestId,
-												signature->id(),
-												maxLocalLocationsImmunized,
-												_localImmunizationRatio,
-												maxLocalLocationsImmunized,
-												(int)_memory->getWorkingMem().size());
-									}
-									break;
-								}
-								else if(!_memory->isInSTM(iter->first))
-								{
-									if(immunizedLocations.insert(iter->first).second)
-									{
-										++immunizedLocally;
-									}
-									//UDEBUG("local node %d on path immunized=1", iter->first);
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// retrieval based on the nodes close the the nearest pose in WM
 			// immunize closest nodes
 			std::map<int, float> nearNodes = graph::findNearestNodes(signature->id(), _optimizedPoses, _localRadius);
 			// sort by distance
@@ -2584,12 +2658,40 @@ int Rtabmap::process(
 			reactivatedIds.insert(reactivatedIds.begin(), retrievalLocalIds.begin(), retrievalLocalIds.end());
 		}
 	}
-
+	timing.retrieval_phase2_ms = sectionTimer.ticks() * 1000.0;
 	//============================================================
 	// RETRIEVAL 3/3 : Load signatures from the database
 	//============================================================
+	sectionTimer.start();
 	if(reactivatedIds.size())
 	{
+		// New: enqueue for background reactivation (bounded, dedup). We still keep
+		// synchronous path below for now to preserve behavior; this starts making loads
+		// more asynchronous across frames without changing logic elsewhere.
+		if(_bgReactEnabled)
+		{
+			std::lock_guard<std::mutex> lock(g_bgReactMutex);
+			unsigned int nEnqueued = 0;
+			unsigned int nEnqueueLimit = _memory->isIncremental() && _globalReactivationLimit>0 ? _globalReactivationLimit : (unsigned int)reactivatedIds.size();
+			for(std::list<int>::const_iterator it = reactivatedIds.begin(); it!=reactivatedIds.end() && nEnqueued < nEnqueueLimit; ++it)
+			{
+				if(g_bgReactQueued.insert(*it).second)
+				{
+					if(g_bgReactQueue.size() >= g_bgReactQueueMax)
+					{
+						// drop oldest to keep most recent candidates
+						int dropped = g_bgReactQueue.front();
+						g_bgReactQueue.pop_front();
+						g_bgReactQueued.erase(dropped);
+					}
+					g_bgReactQueue.push_back(*it);
+					nEnqueued++;
+				}
+			}
+		}
+
+		// Reset per-iteration background budget to remaining capacity after foreground loads are decided
+
 		// In localization mode, bypass global reactivation limits to allow proper startup
 		if(!_memory->isIncremental())
 		{
@@ -2681,10 +2783,56 @@ int Rtabmap::process(
 		
 		UINFO("Reactivation request: ids=%d, requestedMaxLoaded=%u, hardCap=%u, effectiveMaxLoaded=%u (incremental=%s)", 
 			  (int)reactivatedIds.size(), requestedMaxLoaded, hardCap, effectiveMaxLoaded, _memory->isIncremental()?"true":"false");
-		signaturesRetrieved = _memory->reactivateSignatures(
-				reactivatedIds,
-				effectiveMaxLoaded,
-				timeRetrievalDbAccess);
+
+		// Budget for background worker this iteration = GlobalReactivationLimit - foreground used
+		if(_memory->isIncremental() && _globalReactivationLimit>0)
+		{
+			// Foreground will load up to effectiveMaxLoaded below
+			int remaining = (int)_globalReactivationLimit - (int)std::min(effectiveMaxLoaded, (unsigned int)reactivatedIds.size());
+			if(remaining < 0) remaining = 0;
+			_bgReactBudget.store(remaining);
+		}
+		else
+		{
+			_bgReactBudget.store(0);
+		}
+
+		// Partially asynchronous approach: try to take a few ids from the background
+		// queue first (if any are already prepared by a future worker) – for now,
+		// we just prioritize queue order and keep synchronous load as fallback.
+		std::list<int> toLoad = reactivatedIds;
+		if(_bgReactEnabled)
+		{
+			std::lock_guard<std::mutex> lock(g_bgReactMutex);
+			if(!g_bgReactQueue.empty())
+			{
+				// Move a small slice from the queue head to front of load list
+				unsigned int slice = std::min<unsigned int>(effectiveMaxLoaded, (unsigned int)g_bgReactQueue.size());
+				std::list<int> head;
+				for(unsigned int i=0; i<slice; ++i)
+				{
+					int id = g_bgReactQueue.front();
+					g_bgReactQueue.pop_front();
+					g_bgReactQueued.erase(id);
+					head.push_back(id);
+				}
+				// Prepend to load list, preserving de-duplication
+				head.reverse();
+				for(std::list<int>::const_iterator it = head.begin(); it!=head.end(); ++it)
+				{
+					toLoad.remove(*it);
+					toLoad.push_front(*it);
+				}
+			}
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(g_reactivationMutex);
+			signaturesRetrieved = _memory->reactivateSignatures(
+					toLoad,
+					effectiveMaxLoaded,
+					timeRetrievalDbAccess);
+		}
 
 		ULOGGER_INFO("retrieval of %d (db time = %fs)", (int)signaturesRetrieved.size(), timeRetrievalDbAccess);
 
@@ -2703,10 +2851,11 @@ int Rtabmap::process(
 	}
 	timeReactivations = timer.ticks();
 	ULOGGER_INFO("timeReactivations=%fs", timeReactivations);
-
+	timing.retrieval_phase3_ms = sectionTimer.ticks() * 1000.0;
 	//============================================================
 	// Proximity detections
 	//============================================================
+	sectionTimer.start();
 	std::list<std::pair<int, int> > loopClosureLinksAdded;
 	int loopClosureVisualInliers = 0; // for statistics
 	float loopClosureVisualInliersRatio = 0.0f;
@@ -2715,7 +2864,6 @@ int Rtabmap::process(
 	float loopClosureAngularVariance = 0.0f;
 	float loopClosureVisualInliersMeanDist = 0;
 	float loopClosureVisualInliersDistribution = 0;
-
 	int proximityDetectionsAddedVisually = 0;
 	int proximityDetectionsAddedByICPMulti = 0;
 	int proximityDetectionsAddedByICPGlobal = 0;
@@ -2724,7 +2872,6 @@ int Rtabmap::process(
 	int localVisualPathsChecked = 0;
 	int localScanPathsChecked = 0;
 	int loopIdSuppressedByProximity = 0;
-
 	if(_proximityBySpace &&
 	   _localRadius > 0 &&
 	   _rgbdSlamMode &&
@@ -3133,11 +3280,12 @@ int Rtabmap::process(
 	}
 	timeProximityBySpaceDetection = timer.ticks();
 	ULOGGER_INFO("timeProximityBySpaceDetection=%fs", timeProximityBySpaceDetection);
-
+	timing.proximity_detection_ms = sectionTimer.ticks() * 1000.0;
 	//=============================================================
 	// Global loop closure detection
 	// (updated: place this after retrieval to be sure that neighbors of the loop closure are in RAM)
 	//=============================================================
+	sectionTimer.start();
 	if(_loopClosureHypothesis.first>0)
 	{
 		if(loopIdSuppressedByProximity==0)
@@ -3205,10 +3353,12 @@ int Rtabmap::process(
 
 	timeAddLoopClosureLink = timer.ticks();
 	ULOGGER_INFO("timeAddLoopClosureLink=%fs", timeAddLoopClosureLink);
+	timing.loop_closure_ms = sectionTimer.ticks() * 1000.0;
 
 	//============================================================
 	// Landmark
 	//============================================================
+	sectionTimer.start();
 	std::map<int, std::set<int> > landmarksDetected; // <Landmark ID, list of nodes that saw this landmark>
 	if(!signature->getLandmarks().empty() && !_graphOptimizer->landmarksIgnored())
 	{
@@ -3243,9 +3393,12 @@ int Rtabmap::process(
 		}
 	}
 
+	timing.landmarks_ms = sectionTimer.ticks() * 1000.0;
+
 	//============================================================
 	// Add virtual links if a path is activated
 	//============================================================
+	sectionTimer.start();
 	if(_path.size())
 	{
 		// Add a virtual loop closure link to keep the path linked to local map
@@ -3259,9 +3412,12 @@ int Rtabmap::process(
 		}
 	}
 
+	timing.virtual_links_ms = sectionTimer.ticks() * 1000.0;
+
 	//============================================================
 	// Optimize map graph
 	//============================================================
+	sectionTimer.start();
 	float maxLinearError = 0.0f;
 	float maxLinearErrorRatio = 0.0f;
 	float maxAngularError = 0.0f;
@@ -3283,7 +3439,6 @@ int Rtabmap::process(
 	UDEBUG("Landmarks: %d", (int)landmarksDetected.size());
 	UDEBUG("Retrieved: %d", (int)signaturesRetrieved.size());
 	UDEBUG("Not self ref links: %d", (int)graph::filterLinks(signature->getLinks(), Link::kSelfRefLink).size());
-
 	if(_rgbdSlamMode
 		&&
 		(_loopClosureHypothesis.first>0 ||
@@ -3664,7 +3819,6 @@ int Rtabmap::process(
 						}
 					}
 				}
-
 				if(!rejectLocalization)
 				{
 					if(hasGlobalLoopClosuresOrLandmarks)
@@ -4025,7 +4179,7 @@ int Rtabmap::process(
 			}
 		}
 
-		// Update map correction, it should be identify when optimizing from the last node
+		// Update map correction, it should be identity when optimizing from the last node
 		UASSERT(_optimizedPoses.find(signature->id()) != _optimizedPoses.end());
 		if(fakeOdom && _mapCorrectionBackup.isNull())
 		{
@@ -4036,7 +4190,7 @@ int Rtabmap::process(
 		// Update statistics about the closest node in the graph using the actual loop closure
 		if(!_memory->isIncremental() && !_lastLocalizationPose.isNull())
 		{
-			int closestNode = _loopClosureHypothesis.first>0?_loopClosureHypothesis.first:lastProximitySpaceClosureId;
+			int closestNode = _loopClosureHypothesis.first>0?_loopClosureHypothesis.first:lastProximitySpaceClosureId>0?lastProximitySpaceClosureId:_highestHypothesis.first;
 			if(closestNode>0)
 			{
 				distanceToClosestNodeInTheGraph = _lastLocalizationPose.getDistance(_optimizedPoses.at(closestNode));
@@ -4080,10 +4234,12 @@ int Rtabmap::process(
 
 	timeMapOptimization = timer.ticks();
 	ULOGGER_INFO("timeMapOptimization=%fs", timeMapOptimization);
+	timing.optimization_ms = sectionTimer.ticks() * 1000.0;
 
 	//============================================================
 	// Prepare statistics
 	//============================================================
+	sectionTimer.start();
 	// Data used for the statistics event and for the log files
 	int dictionarySize = 0;
 	int refWordsCount = 0;
@@ -4091,7 +4247,7 @@ int Rtabmap::process(
 	int lcHypothesisReactivated = 0;
 	float rehearsalValue = uValue(statistics_.data(), Statistics::kMemoryRehearsal_sim(), 0.0f);
 	int rehearsalMaxId = (int)uValue(statistics_.data(), Statistics::kMemoryRehearsal_merged(), 0.0f);
-	sLoop = _memory->getSignature(_loopClosureHypothesis.first?_loopClosureHypothesis.first:lastProximitySpaceClosureId?lastProximitySpaceClosureId:_highestHypothesis.first);
+	sLoop = _memory->getSignature(_loopClosureHypothesis.first>0?_loopClosureHypothesis.first:lastProximitySpaceClosureId>0?lastProximitySpaceClosureId:_highestHypothesis.first);
 	if(sLoop)
 	{
 		lcHypothesisReactivated = sLoop->isSaved()?1.0f:0.0f;
@@ -4107,11 +4263,9 @@ int Rtabmap::process(
 		_localizationCovariance.at<double>(3,3) = Registration::COVARIANCE_ANGULAR_EPSILON;
 		_localizationCovariance.at<double>(4,4) = Registration::COVARIANCE_ANGULAR_EPSILON;
 	}
-
 	// Posterior is empty if a bad signature is detected
 	float vpHypothesis = posterior.size()?posterior.at(Memory::kIdVirtual):0.0f;
 	int loopId = _loopClosureHypothesis.first>0?_loopClosureHypothesis.first:lastProximitySpaceClosureId;
-
 	// prepare statistics
 	if(_loopClosureHypothesis.first || _publishStats)
 	{
@@ -4268,8 +4422,27 @@ int Rtabmap::process(
 			statistics_.addStatistic(Statistics::kTimingHypotheses_validation(), timeHypothesesValidation*1000);
 			statistics_.addStatistic(Statistics::kTimingCleaning_neighbors(), timeCleaningNeighbors*1000);
 
-			// retrieval
-			statistics_.addStatistic(Statistics::kMemorySignatures_retrieved(), (float)signaturesRetrieved.size());
+			// retrieval (with breakdown local/global)
+			{
+				unsigned int retrievedLocal = 0;
+				if(!signaturesRetrieved.empty() && !retrievalLocalIds.empty())
+				{
+					std::set<int> localSet(retrievalLocalIds.begin(), retrievalLocalIds.end());
+					for(std::set<int>::const_iterator it = signaturesRetrieved.begin(); it != signaturesRetrieved.end(); ++it)
+					{
+						if(localSet.find(*it) != localSet.end())
+						{
+							++retrievedLocal;
+						}
+					}
+				}
+				unsigned int retrievedTotal = (unsigned int)signaturesRetrieved.size();
+				unsigned int retrievedGlobal = retrievedTotal > retrievedLocal ? retrievedTotal - retrievedLocal : 0u;
+
+				statistics_.addStatistic(Statistics::kMemorySignatures_retrieved(), (float)retrievedTotal);
+				statistics_.addStatistic(Statistics::kMemorySignatures_retrieved_local(), (float)retrievedLocal);
+				statistics_.addStatistic(Statistics::kMemorySignatures_retrieved_global(), (float)retrievedGlobal);
+			}
 
 			// Feature specific parameters
 			statistics_.addStatistic(Statistics::kKeypointDictionary_size(), dictionarySize);
@@ -4284,6 +4457,14 @@ int Rtabmap::process(
 			statistics_.addStatistic(Statistics::kMemoryDistance_travelled(), _distanceTravelled);
 			statistics_.addStatistic(Statistics::kMemoryFast_movement(), tooFastMovement?1.0f:0);
 			statistics_.addStatistic(Statistics::kMemoryNew_landmark(), addedNewLandmark?1.0f:0);
+
+			// Calculate and add rehearsal percentage
+			float rehearsalPercentage = 0.0f;
+			if(_totalFramesProcessed > 0)
+			{
+				rehearsalPercentage = (float)_totalFramesRehearsed / (float)_totalFramesProcessed * 100.0f;
+			}
+			statistics_.addStatistic(Statistics::kMemoryRehearsal_percentage(), rehearsalPercentage);
 
 			if(distanceToClosestNodeInTheGraph>0.0)
 			{
@@ -4437,9 +4618,12 @@ int Rtabmap::process(
 
 
 
+	timing.statistics_preparation_ms = sectionTimer.ticks() * 1000.0;
+
 	//============================================================
 	// TRANSFER
 	//============================================================
+	sectionTimer.start();
 	// If time allowed for the detection exceeds the limit of
 	// real-time, move the oldest signature with less frequency
 	// entry (from X oldest) from the short term memory to the
@@ -4460,8 +4644,58 @@ int Rtabmap::process(
 		}
 	}
 	_lastProcessTime = totalTime;
+	timing.transfer_ms = sectionTimer.ticks() * 1000.0;
+	//============================================================
+	// GlobalWMLimit enforcement
+	//============================================================
+	sectionTimer.start();
+	double timeGlobalWMLimit = 0.0;
+	timer.start();
+	// If GlobalWMLimit is set and WM exceeds the limit, transfer oldest nodes to LTM
+	if(_globalWMLimit > 0 && _memory->getWorkingMem().size() > _globalWMLimit)
+	{
+		ULOGGER_INFO("Working memory size (%d) exceeds GlobalWMLimit (%d), transferring oldest nodes to LTM...", 
+			(int)_memory->getWorkingMem().size(), _globalWMLimit);
+		
+		// No immunization for GlobalWMLimit - transfer ANY nodes to enforce hard limit
+		std::set<int> immunizedForWMLimit; // Empty set = no immunization
+		
+		// Calculate how many nodes need to be transferred
+		int nodesToTransfer = (int)_memory->getWorkingMem().size() - _globalWMLimit;
+		
+		// Transfer oldest nodes until we're at or below the limit
+		while(_memory->getWorkingMem().size() > _globalWMLimit && nodesToTransfer > 0)
+		{
+			std::list<int> transferred = _memory->forget(immunizedForWMLimit);
+			if(transferred.empty())
+			{
+				// No more nodes can be transferred (should not happen with empty immunization)
+				ULOGGER_WARN("Cannot transfer any more nodes from WM (size=%d) - this should not happen with GlobalWMLimit", 
+					(int)_memory->getWorkingMem().size());
+				break;
+			}
+			
+			signaturesRemoved.insert(signaturesRemoved.end(), transferred.begin(), transferred.end());
+			nodesToTransfer -= (int)transferred.size();
+			
+			if(!_someNodesHaveBeenTransferred && transferred.size())
+			{
+				_someNodesHaveBeenTransferred = true;
+			}
+			
+			ULOGGER_DEBUG("Transferred %d nodes to LTM, WM size now: %d", 
+				(int)transferred.size(), (int)_memory->getWorkingMem().size());
+		}
+		
+		ULOGGER_INFO("GlobalWMLimit enforcement complete. Final WM size: %d", (int)_memory->getWorkingMem().size());
+	}
+	timeGlobalWMLimit = timer.ticks();
+	ULOGGER_INFO("timeGlobalWMLimit=%fs", timeGlobalWMLimit);
+
+	timing.global_wm_limit_ms = sectionTimer.ticks() * 1000.0;
 
 	// cleanup cached gps values
+	sectionTimer.start();
 	for(std::list<int>::iterator iter=signaturesRemoved.begin(); iter!=signaturesRemoved.end() && _gpsGeocentricCache.size(); ++iter)
 	{
 		_gpsGeocentricCache.erase(*iter);
@@ -4583,20 +4817,20 @@ int Rtabmap::process(
 		UASSERT_MSG(uContains(_optimizedPoses, _path.at(_pathCurrentIndex).first), uFormat("local map size=%d, id=%d", (int)_optimizedPoses.size(), _path.at(_pathCurrentIndex).first).c_str());
 		UASSERT_MSG(uContains(_optimizedPoses, _path.at(_pathGoalIndex).first), uFormat("local map size=%d, id=%d", (int)_optimizedPoses.size(), _path.at(_pathGoalIndex).first).c_str());
 	}
-
-
 	timeRealTimeLimitReachedProcess = timer.ticks();
 	ULOGGER_INFO("Time limit reached processing = %f...", timeRealTimeLimitReachedProcess);
-
+	timing.pose_cleanup_ms = sectionTimer.ticks() * 1000.0;
 	//==============================================================
 	// Finalize statistics and log files
 	//==============================================================
+	sectionTimer.start();
 	int localGraphSize = 0;
 	if(_publishStats)
 	{
 		statistics_.addStatistic(Statistics::kTimingStatistics_creation(), timeStatsCreation*1000);
 		statistics_.addStatistic(Statistics::kTimingTotal(), totalTime*1000);
 		statistics_.addStatistic(Statistics::kTimingForgetting(), timeRealTimeLimitReachedProcess*1000);
+		statistics_.addStatistic(Statistics::kTimingGlobal_wm_limit(), timeGlobalWMLimit*1000);
 		statistics_.addStatistic(Statistics::kTimingJoining_trash(), timeJoiningTrash*1000);
 		statistics_.addStatistic(Statistics::kTimingEmptying_trash(), timeEmptyingTrash*1000);
 		statistics_.addStatistic(Statistics::kTimingMemory_cleanup(), timeMemoryCleanup*1000);
@@ -4861,7 +5095,42 @@ int Rtabmap::process(
 		statistics_.addStatistic(Statistics::kTimingFinalizing_statistics(), timeFinalizingStatistics*1000);
 	}
 
-	return 42; // Custom build marker!
+	// Finalize custom timing
+	timing.statistics_creation_ms = sectionTimer.ticks() * 1000.0;
+	timing.total_ms = customTimer.ticks() * 1000.0;
+	
+	// Calculate unaccounted time
+	double accounted = timing.initialization_ms + timing.memory_update_ms + timing.metric_processing_ms +
+					  timing.proximity_by_time_ms + timing.bayes_filter_ms + 
+					  timing.retrieval_phase1_ms + timing.retrieval_phase2_ms + timing.retrieval_phase3_ms +
+					  timing.proximity_detection_ms + timing.loop_closure_ms + timing.landmarks_ms +
+					  timing.virtual_links_ms + timing.optimization_ms + timing.statistics_preparation_ms +
+					  timing.transfer_ms + timing.global_wm_limit_ms + timing.pose_cleanup_ms +
+					  timing.statistics_creation_ms;
+	timing.unaccounted_ms = timing.total_ms - accounted;
+	
+	// Publish background queue diagnostics
+	{
+		std::lock_guard<std::mutex> lock(g_bgReactMutex);
+		float qsz = (float)g_bgReactQueue.size();
+		float qcap = (float)g_bgReactQueueMax;
+		float qfill = qcap>0.0f ? (qsz/qcap)*100.0f : 0.0f;
+		statistics_.addStatistic(Statistics::kMemoryBg_queue_size(), qsz);
+		statistics_.addStatistic(Statistics::kMemoryBg_queue_capacity(), qcap);
+		statistics_.addStatistic(Statistics::kMemoryBg_queue_fill_percent(), qfill);
+	}
+	statistics_.addStatistic(Statistics::kMemoryBg_budget_remaining(), (float)_bgReactBudget.load());
+ 
+ 	// Return custom timing if requested
+	if(customTiming)
+	{
+		*customTiming = timing;
+	}
+ 
+ 	// mark not processing before returning
+ 	_isProcessing = false;
+ 
+ 	return 42; // Custom build marker!
 }
 
 // SETTERS
@@ -5031,7 +5300,6 @@ void Rtabmap::setOptimizedPoses(const std::map<int, Transform> & poses, const st
 	_optimizedPoses = poses;
     _constraints = constraints;
 }
-
 void Rtabmap::dumpData() const
 {
 	UDEBUG("");
@@ -5165,7 +5433,6 @@ std::map<int, Transform> Rtabmap::getForwardWMPoses(
 	}
 	return poses;
 }
-
 std::map<int, std::map<int, Transform> > Rtabmap::getPaths(const std::map<int, Transform> & posesIn, const Transform & target, int maxGraphDepth) const
 {
 	std::map<int, std::map<int, Transform> > paths;
@@ -5637,8 +5904,8 @@ void Rtabmap::getGraph(
 			}
 			else
 			{
-				std::map<int, int> ids = _memory->getNeighborsId(_memory->getLastWorkingSignature()->id(), 0, global?-1:0, true);
-				_memory->getMetricConstraints(uKeysSet(ids), poses, constraints, global);
+				std::map<int, int> ids = _memory->getNeighborsId(_memory->getLastWorkingSignature()->id(), 0, global?-1:0, true, false);
+				_memory->getMetricConstraints(uKeysSet(ids), poses, constraints, global, !_graphOptimizer->landmarksIgnored());
 			}
 		}
 		else
@@ -5677,7 +5944,6 @@ void Rtabmap::getGraph(
 		UWARN("Memory not initialized...");
 	}
 }
-
 std::map<int, Transform> Rtabmap::getNodesInRadius(const Transform & pose, float radius, int k, std::map<int, float> * distsSqr)
 {
 	std::map<int, float> nearestNodesTmp;
@@ -5721,7 +5987,6 @@ std::map<int, Transform> Rtabmap::getNodesInRadius(int nodeId, float radius, int
 
 	return nearestPoses;
 }
-
 int Rtabmap::detectMoreLoopClosures(
 		float clusterRadiusMax,
 		float clusterAngle,
@@ -6183,7 +6448,6 @@ int Rtabmap::refineLinks()
 	}
 	return (int)linksRefined.size();
 }
-
 bool Rtabmap::addLink(const Link & link)
 {
 	const Transform & t = link.transform();
@@ -6769,7 +7033,6 @@ bool Rtabmap::computePath(int targetNode, bool global)
 
 	return false;
 }
-
 bool Rtabmap::computePath(const Transform & targetPose, float tolerance)
 {
 	this->clearPath(0);
@@ -7319,6 +7582,86 @@ void Rtabmap::createGlobalScanMap()
 		_globalScanMap.clear();
 		_globalScanMapPoses.clear();
 	}
+}
+
+void Rtabmap::bgReactWorker()
+{
+	UINFO("Background reactivation worker loop running");
+	while(!_bgReactStop)
+	{
+		// Do not compete with the main processing loop
+		if(_isProcessing)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(_bgReactIdleMs));
+			continue;
+		}
+
+		// Check if memory is still valid (could be deleted during shutdown)
+		if(!_memory)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(_bgReactIdleMs));
+			continue;
+		}
+
+		std::list<int> batch;
+		{
+			std::lock_guard<std::mutex> lock(g_bgReactMutex);
+			for(unsigned int i=0; i<_bgReactSlice && !g_bgReactQueue.empty(); ++i)
+			{
+				int id = g_bgReactQueue.front();
+				g_bgReactQueue.pop_front();
+				g_bgReactQueued.erase(id);
+				batch.push_back(id);
+			}
+		}
+
+		if(batch.empty())
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(_bgReactIdleMs));
+			continue;
+		}
+
+		// Reactivate a small batch. Limit by _bgReactSlice.
+		double tdb = 0.0;
+		try
+		{
+			unsigned int maxThisCall = _bgReactSlice;
+			if(_memory && _memory->isIncremental() && _globalReactivationLimit>0)
+			{
+				int budget = _bgReactBudget.load();
+				if(budget <= 0)
+				{
+					std::this_thread::sleep_for(std::chrono::milliseconds(_bgReactIdleMs));
+					continue;
+				}
+				if((int)maxThisCall > budget) maxThisCall = (unsigned int)budget;
+			}
+			
+			// Double-check memory is still valid before calling
+			if(_memory)
+			{
+				std::lock_guard<std::mutex> lock(g_reactivationMutex);
+				if(_memory) // Check again inside lock in case of race
+				{
+					_memory->reactivateSignatures(batch, maxThisCall, tdb);
+				}
+			}
+			
+			if(_memory && _memory->isIncremental() && _globalReactivationLimit>0)
+			{
+				int prev = _bgReactBudget.load();
+				int used = (int)std::min<unsigned int>(maxThisCall, (unsigned int)batch.size());
+				int next = prev - used;
+				if(next < 0) next = 0;
+				_bgReactBudget.store(next);
+			}
+		}
+		catch(const std::exception & e)
+		{
+			UERROR("bgReactWorker exception: %s", e.what());
+		}
+	}
+	UINFO("Background reactivation worker loop exiting");
 }
 
 } // namespace rtabmap

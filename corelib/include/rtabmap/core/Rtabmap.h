@@ -40,9 +40,43 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <list>
 #include <stack>
 #include <set>
+#include <thread>
+#include <atomic>
 
 namespace rtabmap
 {
+
+// Custom timing breakdown structure
+struct RTABMAP_CORE_EXPORT ProcessTiming
+{
+	double total_ms;
+	double initialization_ms;
+	double memory_update_ms;
+	double metric_processing_ms;
+	double proximity_by_time_ms;
+	double bayes_filter_ms;
+	double retrieval_phase1_ms;
+	double retrieval_phase2_ms;
+	double retrieval_phase3_ms;
+	double proximity_detection_ms;
+	double loop_closure_ms;
+	double landmarks_ms;
+	double virtual_links_ms;
+	double optimization_ms;
+	double statistics_preparation_ms;
+	double transfer_ms;
+	double global_wm_limit_ms;
+	double pose_cleanup_ms;
+	double statistics_creation_ms;
+	double unaccounted_ms;
+	
+	ProcessTiming() : 
+		total_ms(0.0), initialization_ms(0.0), memory_update_ms(0.0), metric_processing_ms(0.0),
+		proximity_by_time_ms(0.0), bayes_filter_ms(0.0), retrieval_phase1_ms(0.0), retrieval_phase2_ms(0.0),
+		retrieval_phase3_ms(0.0), proximity_detection_ms(0.0), loop_closure_ms(0.0), landmarks_ms(0.0),
+		virtual_links_ms(0.0), optimization_ms(0.0), statistics_preparation_ms(0.0), transfer_ms(0.0),
+		global_wm_limit_ms(0.0), pose_cleanup_ms(0.0), statistics_creation_ms(0.0), unaccounted_ms(0.0) {}
+};
 
 class EpipolarGeometry;
 class Memory;
@@ -74,6 +108,14 @@ public:
 			const cv::Mat & odomCovariance = cv::Mat::eye(6,6,CV_64FC1),
 			const std::vector<float> & odomVelocity = std::vector<float>(),
 			const std::map<std::string, float> & externalStats = std::map<std::string, float>());
+	// with custom timing output
+	int process(
+			const SensorData & data,
+			Transform odomPose,
+			const cv::Mat & odomCovariance,
+			const std::vector<float> & odomVelocity,
+			const std::map<std::string, float> & externalStats,
+			ProcessTiming * customTiming);
 	// for convenience
 	int process(
 			const SensorData & data,
@@ -82,6 +124,15 @@ public:
 			float odomAngularVariance,
 			const std::vector<float> & odomVelocity = std::vector<float>(),
 			const std::map<std::string, float> & externalStats = std::map<std::string, float>());
+	// with custom timing output
+	int process(
+			const SensorData & data,
+			Transform odomPose,
+			float odomLinearVariance,
+			float odomAngularVariance,
+			const std::vector<float> & odomVelocity,
+			const std::map<std::string, float> & externalStats,
+			ProcessTiming * customTiming);
 	// for convenience, loop closure detection only
 	int process(
 			const cv::Mat & image,
@@ -247,6 +298,7 @@ public:
 											const std::map<int, float> & likelihood) const;
 
 private:
+	void bgReactWorker();
 	void optimizeCurrentMap(int id,
 			bool lookInDatabase,
 			std::map<int, Transform> & optimizedPoses,
@@ -291,6 +343,7 @@ private:
 	unsigned int _maxRetrieved;
 	unsigned int _maxLocalRetrieved;
 	unsigned int _globalReactivationLimit;
+	unsigned int _globalWMLimit;
 	unsigned int _maxRepublished;
 	bool _rawDataKept;
 	bool _statisticLogsBufferedInRAM;
@@ -391,6 +444,19 @@ private:
 	Transform _pathTransformToGoal;
 	int _pathStuckCount;
 	float _pathStuckDistance;
+
+	// Rehearsal tracking for statistics
+	unsigned int _totalFramesProcessed;
+	unsigned int _totalFramesRehearsed;
+
+	// Async LTM->WM loading controls
+	bool _bgReactEnabled;
+	unsigned int _bgReactSlice;
+	unsigned int _bgReactIdleMs;
+	std::thread * _bgReactThread;
+	std::atomic<bool> _bgReactStop;
+	std::atomic<bool> _isProcessing;
+	std::atomic<int> _bgReactBudget; // remaining budget this iteration (<= GlobalReactivationLimit)
 
 #ifdef RTABMAP_PYTHON
 	PythonInterface * _python;

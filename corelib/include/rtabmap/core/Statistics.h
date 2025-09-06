@@ -140,6 +140,10 @@ class RTABMAP_CORE_EXPORT Statistics
 	RTABMAP_STATS(Memory, Rehearsal_sim,);
 	RTABMAP_STATS(Memory, Rehearsal_id,);
 	RTABMAP_STATS(Memory, Rehearsal_merged,);
+	RTABMAP_STATS(Memory, Rehearsal_percentage,%);
+	// Retrieval breakdown (per process)
+	RTABMAP_STATS(Memory, Signatures_retrieved_local,);
+	RTABMAP_STATS(Memory, Signatures_retrieved_global,);
 	RTABMAP_STATS(Memory, Local_graph_size,);
 	RTABMAP_STATS(Memory, Odom_cache_poses,);
 	RTABMAP_STATS(Memory, Odom_cache_links,);
@@ -154,6 +158,11 @@ class RTABMAP_CORE_EXPORT Statistics
 	RTABMAP_STATS(Memory, Triangulated_points, );
 	RTABMAP_STATS(Memory, Closest_node_distance, m);
 	RTABMAP_STATS(Memory, Closest_node_angle, rad);
+	// Background reactivation diagnostics
+	RTABMAP_STATS(Memory, Bg_queue_size,);
+	RTABMAP_STATS(Memory, Bg_queue_capacity,);
+	RTABMAP_STATS(Memory, Bg_queue_fill_percent,%);
+	RTABMAP_STATS(Memory, Bg_budget_remaining,);
 
 	RTABMAP_STATS(Timing, Memory_update, ms);
 	RTABMAP_STATS(Timing, Neighbor_link_refining, ms);
@@ -173,6 +182,7 @@ class RTABMAP_CORE_EXPORT Statistics
 	RTABMAP_STATS(Timing, Memory_cleanup, ms);
 	RTABMAP_STATS(Timing, Total, ms);
 	RTABMAP_STATS(Timing, Forgetting, ms);
+	RTABMAP_STATS(Timing, Global_wm_limit, ms);
 	RTABMAP_STATS(Timing, Joining_trash, ms);
 	RTABMAP_STATS(Timing, Emptying_trash, ms);
 	RTABMAP_STATS(Timing, Finalizing_statistics, ms);
