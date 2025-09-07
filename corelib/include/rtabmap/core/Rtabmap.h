@@ -282,6 +282,7 @@ private:
 	bool _saveWMState;
 	float _maxTimeAllowed; // in ms
 	unsigned int _maxMemoryAllowed; // signatures count in WM
+	unsigned int _globalWMLimit; // forceful WM limit (signatures count)
 	float _loopThr;
 	float _loopRatio;
 	float _aggressiveLoopThr;

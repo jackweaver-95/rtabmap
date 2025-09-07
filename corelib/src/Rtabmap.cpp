@@ -101,6 +101,7 @@ Rtabmap::Rtabmap() :
 	_saveWMState(Parameters::defaultRtabmapSaveWMState()),
 	_maxTimeAllowed(Parameters::defaultRtabmapTimeThr()), // 700 ms
 	_maxMemoryAllowed(Parameters::defaultRtabmapMemoryThr()), // 0=inf
+	_globalWMLimit(0), // 0=unlimited
 	_loopThr(Parameters::defaultRtabmapLoopThr()),
 	_loopRatio(Parameters::defaultRtabmapLoopRatio()),
 	_aggressiveLoopThr(Parameters::defaultRGBDAggressiveLoopThr()),
@@ -570,6 +571,12 @@ void Rtabmap::parseParameters(const ParametersMap & parameters)
 	Parameters::parse(parameters, Parameters::kRtabmapSaveWMState(), _saveWMState);
 	Parameters::parse(parameters, Parameters::kRtabmapTimeThr(), _maxTimeAllowed);
 	Parameters::parse(parameters, Parameters::kRtabmapMemoryThr(), _maxMemoryAllowed);
+	// Parse GlobalWMLimit parameter
+	ParametersMap::const_iterator globalWMLimitIter = parameters.find("Rtabmap/GlobalWMLimit");
+	if(globalWMLimitIter != parameters.end())
+	{
+		_globalWMLimit = (unsigned int)std::atoi(globalWMLimitIter->second.c_str());
+	}
 	Parameters::parse(parameters, Parameters::kRtabmapLoopThr(), _loopThr);
 	Parameters::parse(parameters, Parameters::kRtabmapLoopRatio(), _loopRatio);
 	Parameters::parse(parameters, Parameters::kRGBDAggressiveLoopThr(), _aggressiveLoopThr);
@@ -4447,8 +4454,23 @@ int Rtabmap::process(
 	//============================================================
 	double totalTime = timerTotal.ticks();
 	ULOGGER_INFO("Total time processing = %fs...", totalTime);
-	if((_maxTimeAllowed != 0 && totalTime*1000>_maxTimeAllowed) ||
-		(_maxMemoryAllowed != 0 && _memory->getWorkingMem().size() > _maxMemoryAllowed))
+	
+	// Check GlobalWMLimit first (more forceful - no immunization)
+	if(_globalWMLimit != 0 && _memory->getWorkingMem().size() > _globalWMLimit)
+	{
+		ULOGGER_INFO("Removing old signatures because GlobalWMLimit is reached %d>%d (forceful transfer)...", 
+					 (int)_memory->getWorkingMem().size(), _globalWMLimit);
+		std::set<int> noImmunization; // Empty set - nothing is protected
+		std::list<int> transferred = _memory->forget(noImmunization);
+		signaturesRemoved.insert(signaturesRemoved.end(), transferred.begin(), transferred.end());
+		if(!_someNodesHaveBeenTransferred && transferred.size())
+		{
+			_someNodesHaveBeenTransferred = true; // only used to hide a warning on close nodes immunization
+		}
+	}
+	// Regular time/memory limits (with immunization)
+	else if((_maxTimeAllowed != 0 && totalTime*1000>_maxTimeAllowed) ||
+		    (_maxMemoryAllowed != 0 && _memory->getWorkingMem().size() > _maxMemoryAllowed))
 	{
 		ULOGGER_INFO("Removing old signatures because time limit is reached %f>%f or memory is reached %d>%d...", totalTime*1000, _maxTimeAllowed, _memory->getWorkingMem().size(), _maxMemoryAllowed);
 		immunizedLocations.insert(_lastLocalizationNodeId); // keep the latest localization in working memory
