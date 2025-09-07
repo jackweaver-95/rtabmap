@@ -344,6 +344,7 @@ private:
 	unsigned int _maxLocalRetrieved;
 	unsigned int _globalReactivationLimit;
 	unsigned int _globalWMLimit;
+	bool _globalWMLimitRandomRemoval;
 	unsigned int _maxRepublished;
 	bool _rawDataKept;
 	bool _statisticLogsBufferedInRAM;

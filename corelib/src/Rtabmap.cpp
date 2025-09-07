@@ -126,6 +126,7 @@ Rtabmap::Rtabmap() :
 	_maxLocalRetrieved(Parameters::defaultRGBDMaxLocalRetrieved()),
 	_globalReactivationLimit(5), // Default: allow 5 nodes LTM->WM per iteration
 	_globalWMLimit(0), // Default: 0 = no limit on WM size
+	_globalWMLimitRandomRemoval(true),
 	_maxRepublished(Parameters::defaultRtabmapMaxRepublished()),
 	_rawDataKept(Parameters::defaultMemImageKept()),
 	_statisticLogsBufferedInRAM(Parameters::defaultRtabmapStatisticLogsBufferedInRAM()),
@@ -420,6 +421,27 @@ void Rtabmap::init(const ParametersMap & parameters, const std::string & databas
 	_optimizedPoses = _memory->loadOptimizedPoses(&lastPose);
 	if(!_memory->isIncremental())
 	{
+		// In localization mode, force loading entire graph into working memory for loop closure detection
+		UINFO("Localization mode detected - loading entire graph into working memory for optimal loop closure detection");
+		
+		// Get all signature IDs from the database
+		std::set<int> allIds = _memory->getAllSignatureIds();
+		if(!allIds.empty())
+		{
+			UINFO("LOCALIZATION STARTUP: Loading %d signatures from database into working memory for localization", (int)allIds.size());
+			UINFO("  -> This is the ENTIRE LTM content being loaded for full loop closure capability");
+			// Convert to list for reactivateSignatures
+			std::list<int> allIdsList(allIds.begin(), allIds.end());
+			double dbAccessTime = 0.0;
+			
+			// Load all signatures into working memory (no limit in localization mode)
+			std::set<int> reactivatedIds = _memory->reactivateSignatures(allIdsList, 0, dbAccessTime); // 0 = no limit
+			UINFO("Successfully loaded %d signatures into working memory (db access time: %fs)", 
+				  (int)reactivatedIds.size(), dbAccessTime);
+			UINFO("  -> VERIFICATION: %d total signatures now available for loop closure (should be >> 61 pose graph nodes)", 
+				  (int)reactivatedIds.size());
+		}
+		
 		if(_optimizedPoses.empty() &&
 			_memory->getWorkingMem().size()>1 &&
 			_memory->getWorkingMem().lower_bound(1)!=_memory->getWorkingMem().end())
@@ -649,6 +671,12 @@ void Rtabmap::parseParameters(const ParametersMap & parameters)
 	if(globalWMLimitIter != parameters.end())
 	{
 		_globalWMLimit = (unsigned int)std::atoi(globalWMLimitIter->second.c_str());
+	}
+	// Parse custom random removal toggle for GlobalWMLimit enforcement
+	ParametersMap::const_iterator globalWMLimitRandIter = parameters.find("Rtabmap/GlobalWMLimitRandomRemoval");
+	if(globalWMLimitRandIter != parameters.end())
+	{
+		_globalWMLimitRandomRemoval = (globalWMLimitRandIter->second == "true" || globalWMLimitRandIter->second == "1");
 	}
 	// Background reactivation tuning
 	ParametersMap::const_iterator bgEnableIter = parameters.find("Rtabmap/BackgroundReactivation");
@@ -1356,6 +1384,20 @@ int Rtabmap::process(
 	customTimer.start();
 	sectionTimer.start();
 
+	// Memory change tracking: capture initial state
+	int initial_wm_size = _memory ? _memory->getWorkingMem().size() : 0;
+	int initial_stm_size = _memory ? _memory->getStMem().size() : 0;
+	
+	// Track explicit transfer counts for accurate reporting
+	int explicit_time_memory_transfers = 0;
+	int explicit_random_transfers = 0; 
+	int explicit_oldest_transfers = 0;
+	
+	// Track gross WM flows to see actual churn (attempts vs removals)
+	int gross_wm_inflow_attempted = 0;  // How many tried to enter WM this frame
+	int gross_wm_outflow_actual = 0;    // How many actually left WM this frame
+	int retrieved_now_for_inflow = 0;   // LTM retrievals this frame
+
 	//============================================================
 	// Initialization
 	//============================================================
@@ -1367,6 +1409,13 @@ int Rtabmap::process(
 	double timeProximityBySpaceSearch = 0;
 	double timeProximityBySpaceVisualDetection = 0;
 	double timeProximityBySpaceDetection = 0;
+	// Detailed proximity-by-space timing breakdown
+	double timeProximitySpaceNearest = 0;
+	double timeProximitySpacePathSegmentation = 0;
+	double timeProximitySpacePathSorting = 0;
+	double timeProximitySpaceVisualRegistration = 0;
+	double timeProximitySpaceScanPreparation = 0;
+	double timeProximitySpaceScanICP = 0;
 	double timeCleaningNeighbors = 0;
 	double timeReactivations = 0;
 	double timeAddLoopClosureLink = 0;
@@ -1639,6 +1688,19 @@ int Rtabmap::process(
 	timeMemoryUpdate = timer.ticks();
 	ULOGGER_INFO("timeMemoryUpdate=%fs", timeMemoryUpdate);
 	timing.memory_update_ms = sectionTimer.ticks() * 1000.0;
+
+	// Memory change tracking: capture state after memory update
+	int post_memory_update_wm_size = _memory ? _memory->getWorkingMem().size() : 0;
+	int post_memory_update_stm_size = _memory ? _memory->getStMem().size() : 0;
+	
+	// Calculate gross WM inflow from memory update (STM->WM + LTM->WM)
+	retrieved_now_for_inflow = (int)uValue(statistics_.data(), Statistics::kMemorySignatures_retrieved(), 0.0f);
+	gross_wm_inflow_attempted = (post_memory_update_wm_size - initial_wm_size) + retrieved_now_for_inflow;
+	if(gross_wm_inflow_attempted < 0) gross_wm_inflow_attempted = 0;
+	
+	ULOGGER_INFO("[WMDEBUG] Memory update: WM %d->%d, STM %d->%d, gross_inflow_attempted=%d (including %d LTM retrievals)", 
+		initial_wm_size, post_memory_update_wm_size, initial_stm_size, post_memory_update_stm_size, 
+		gross_wm_inflow_attempted, retrieved_now_for_inflow);
 	//============================================================
 	// Metric
 	//============================================================
@@ -2132,6 +2194,9 @@ int Rtabmap::process(
 		// fill the short-time memory before a signature is added to the working memory).
 		if(_memory->getWorkingMem().size())
 		{
+			// CUSTOM DEBUG: Log working memory size before loop closure detection
+			UINFO("LOOP CLOSURE DETECTION: Working memory contains %d signatures for comparison", 
+				  (int)_memory->getWorkingMem().size());
 			//============================================================
 			// Likelihood computation
 			// Get the likelihood of the new signature
@@ -2246,6 +2311,15 @@ int Rtabmap::process(
 					// virtual signature should be added
 					signaturesToCompare.push_back(iter->first);
 				}
+			}
+
+			// CUSTOM DEBUG: Log the comparison set size to verify full LTM usage in localization mode
+			UINFO("Loop closure likelihood computation: comparing against %d signatures in working memory (should be entire LTM if in localization mode)", 
+				  (int)signaturesToCompare.size());
+			if(signaturesToCompare.size() > 100) {
+				UINFO("  -> Confirming: Using full LTM content (>100 signatures) for loop closure detection");
+			} else {
+				UWARN("  -> Warning: Only %d signatures available - may not be full LTM", (int)signaturesToCompare.size());
 			}
 
 			rawLikelihood = _memory->computeLikelihood(signature, signaturesToCompare);
@@ -2908,8 +2982,11 @@ int Rtabmap::process(
 				// 1) compare visually with nearest locations
 				//
 				UDEBUG("Proximity detection (local loop closure in SPACE using matching images, local radius=%fm)", _localRadius);
+				UTimer proximityTimer;
+				proximityTimer.start();
 				std::map<int, float> nearestIds = graph::findNearestNodes(signature->id(), _optimizedPoses, _localRadius);
-				UDEBUG("nearestIds=%d/%d", (int)nearestIds.size(), (int)_optimizedPoses.size());
+				timeProximitySpaceNearest = proximityTimer.ticks();
+				UDEBUG("nearestIds=%d/%d (time=%.3fms)", (int)nearestIds.size(), (int)_optimizedPoses.size(), timeProximitySpaceNearest*1000.0);
 				std::map<int, Transform> nearestPoses;
 				std::multimap<int, int> links;
 				if(_memory->isIncremental() && _proximityMaxGraphDepth>0)
@@ -2946,9 +3023,12 @@ int Rtabmap::process(
 				UDEBUG("nearestPoses=%d", (int)nearestPoses.size());
 
 				// segment poses by paths, only one detection per path, landmarks are ignored
+				proximityTimer.start();
 				std::map<int, std::map<int, Transform> > nearestPathsNotSorted = getPaths(nearestPoses, _optimizedPoses.at(signature->id()), _proximityMaxGraphDepth);
-				UDEBUG("got %d paths", (int)nearestPathsNotSorted.size());
+				timeProximitySpacePathSegmentation = proximityTimer.ticks();
+				UDEBUG("got %d paths (segmentation time=%.3fms)", (int)nearestPathsNotSorted.size(), timeProximitySpacePathSegmentation*1000.0);
 				// sort nearest paths by highest likelihood (if two have same likelihood, sort by id)
+				proximityTimer.start();
 				std::map<NearestPathKey, std::map<int, Transform> > nearestPaths;
 				Transform currentPoseInv = _optimizedPoses.at(signature->id()).inverse();
 				for(std::map<int, std::map<int, Transform> >::const_iterator iter=nearestPathsNotSorted.begin();iter!=nearestPathsNotSorted.end(); ++iter)
@@ -2970,7 +3050,8 @@ int Rtabmap::process(
 					}
 					nearestPaths.insert(std::make_pair(NearestPathKey(highestLikelihood, highestLikelihoodId, smallestDistanceSqr), path));
 				}
-				UDEBUG("nearestPaths=%d proximityMaxPaths=%d", (int)nearestPaths.size(), _proximityMaxPaths);
+				timeProximitySpacePathSorting = proximityTimer.ticks();
+				UDEBUG("nearestPaths=%d proximityMaxPaths=%d (sorting time=%.3fms)", (int)nearestPaths.size(), _proximityMaxPaths, timeProximitySpacePathSorting*1000.0);
 
 				timeProximityBySpaceSearch = timer.ticks();
 				ULOGGER_INFO("timeProximityBySpaceSearch=%fs", timeProximityBySpaceSearch);
@@ -3011,6 +3092,7 @@ int Rtabmap::process(
 							 _optimizedPoses.at(signature->id()).getDistanceSquared(_optimizedPoses.at(nearestId)) < proximityFilteringRadius*proximityFilteringRadius))
 						{
 							++localVisualPathsChecked;
+							proximityTimer.start();
 							RegistrationInfo info;
 							Transform guess;
 							if(_proximityOdomGuess)
@@ -3019,6 +3101,7 @@ int Rtabmap::process(
 								guess = _optimizedPoses.at(nearestId).inverse()*_optimizedPoses.at(signature->id());
 							} //else: guess is null to make sure visual correspondences are globally computed
 							Transform transform = _memory->computeTransform(nearestId, signature->id(), guess, &info);
+							timeProximitySpaceVisualRegistration += proximityTimer.ticks();
 							if(!transform.isNull())
 							{
 								transform = transform.inverse();
@@ -3140,6 +3223,7 @@ int Rtabmap::process(
 							}
 
 							// Assemble scans in the path and do ICP only
+							proximityTimer.start();
 							std::map<int, Transform> optimizedLocalPath;
 							if(_globalScanMap.empty() && _proximityRawPosesUsed)
 							{
@@ -3176,6 +3260,7 @@ int Rtabmap::process(
 							{
 								filteredPath = optimizedLocalPath;
 							}
+							timeProximitySpaceScanPreparation += proximityTimer.ticks();
 
 							if(filteredPath.size() > 0)
 							{
@@ -3185,6 +3270,7 @@ int Rtabmap::process(
 								if(signature->getLinks().find(nearestId) == signature->getLinks().end())
 								{
 									++localScanPathsChecked;
+									proximityTimer.start();
 									RegistrationInfo info;
 									Transform transform;
 									bool icpMulti = true;
@@ -3212,6 +3298,7 @@ int Rtabmap::process(
 											transform = transform.inverse();
 										}
 									}
+									timeProximitySpaceScanICP += proximityTimer.ticks();
 
 									if(!transform.isNull())
 									{
@@ -4413,6 +4500,13 @@ int Rtabmap::process(
 			statistics_.addStatistic(Statistics::kTimingProximity_by_space_search(), timeProximityBySpaceSearch*1000);
 			statistics_.addStatistic(Statistics::kTimingProximity_by_space_visual(), timeProximityBySpaceVisualDetection*1000);
 			statistics_.addStatistic(Statistics::kTimingProximity_by_space(), timeProximityBySpaceDetection*1000);
+			// Detailed proximity-by-space timing breakdown
+			statistics_.addStatistic("Timing/ProximitySpace_nearest", timeProximitySpaceNearest*1000);
+			statistics_.addStatistic("Timing/ProximitySpace_path_segmentation", timeProximitySpacePathSegmentation*1000);
+			statistics_.addStatistic("Timing/ProximitySpace_path_sorting", timeProximitySpacePathSorting*1000);
+			statistics_.addStatistic("Timing/ProximitySpace_visual_registration", timeProximitySpaceVisualRegistration*1000);
+			statistics_.addStatistic("Timing/ProximitySpace_scan_preparation", timeProximitySpaceScanPreparation*1000);
+			statistics_.addStatistic("Timing/ProximitySpace_scan_icp", timeProximitySpaceScanICP*1000);
 			statistics_.addStatistic(Statistics::kTimingReactivation(), timeReactivations*1000);
 			statistics_.addStatistic(Statistics::kTimingAdd_loop_closure_link(), timeAddLoopClosureLink*1000);
 			statistics_.addStatistic(Statistics::kTimingMap_optimization(), timeMapOptimization*1000);
@@ -4624,6 +4718,8 @@ int Rtabmap::process(
 	// TRANSFER
 	//============================================================
 	sectionTimer.start();
+	// Snapshot sizes before any transfer pruning to compute inflows this frame
+	int wm_before_transfers = _memory ? _memory->getWorkingMem().size() : 0;
 	// If time allowed for the detection exceeds the limit of
 	// real-time, move the oldest signature with less frequency
 	// entry (from X oldest) from the short term memory to the
@@ -4637,6 +4733,9 @@ int Rtabmap::process(
 		ULOGGER_INFO("Removing old signatures because time limit is reached %f>%f or memory is reached %d>%d...", totalTime*1000, _maxTimeAllowed, _memory->getWorkingMem().size(), _maxMemoryAllowed);
 		immunizedLocations.insert(_lastLocalizationNodeId); // keep the latest localization in working memory
 		std::list<int> transferred = _memory->forget(immunizedLocations);
+		explicit_time_memory_transfers = (int)transferred.size();
+		gross_wm_outflow_actual += explicit_time_memory_transfers;
+		ULOGGER_INFO("[WMDEBUG] Time/memory-based transfer: %d nodes removed", explicit_time_memory_transfers);
 		signaturesRemoved.insert(signaturesRemoved.end(), transferred.begin(), transferred.end());
 		if(!_someNodesHaveBeenTransferred && transferred.size())
 		{
@@ -4645,118 +4744,187 @@ int Rtabmap::process(
 	}
 	_lastProcessTime = totalTime;
 	timing.transfer_ms = sectionTimer.ticks() * 1000.0;
+
+	// Memory change tracking: capture state after time/memory-based transfer (usually unused)
+	int post_time_memory_transfer_wm_size = _memory ? _memory->getWorkingMem().size() : 0;
+	int post_time_memory_transfer_stm_size = _memory ? _memory->getStMem().size() : 0;
+
+	// Compute inflows this frame (before GlobalWMLimit pruning):
+	//  - wm_inflow_from_stm: nodes that left STM and are now in WM (excluding LTM reactivations)  
+	//  - wm_inflow_from_ltm: nodes reactivated from LTM to WM
+	int wm_inflow_from_ltm = retrieved_now_for_inflow; // already calculated above
+	int wm_inflow_from_stm = post_time_memory_transfer_wm_size - wm_before_transfers - wm_inflow_from_ltm;
+	if(wm_inflow_from_stm < 0) wm_inflow_from_stm = 0;
 	//============================================================
 	// GlobalWMLimit enforcement with spatially-aware random deletion
 	//============================================================
 	sectionTimer.start();
 	double timeGlobalWMLimit = 0.0;
 	timer.start();
-	// If GlobalWMLimit is set and WM exceeds the limit, transfer nodes to LTM using spatial random selection
-	if(_globalWMLimit > 0 && _memory->getWorkingMem().size() > _globalWMLimit)
+	// Initialize snapshots for GlobalWMLimit tracking (may not be used if limit not triggered)
+	int post_random_wm_size = post_time_memory_transfer_wm_size;
+	int post_random_stm_size = post_time_memory_transfer_stm_size;
+
+	// If GlobalWMLimit is set and WM exceeds the limit, transfer nodes to LTM.
+	// When _globalWMLimitRandomRemoval=true, use spatially-aware random removal;
+	// otherwise use default oldest-first offloading. Skip enforcement in localization mode.
+	ULOGGER_INFO("[WMDEBUG] GlobalWMLimit check: limit=%d, WM=%d, incremental=%s", 
+		_globalWMLimit, _memory ? (int)_memory->getWorkingMem().size() : 0, 
+		_memory && _memory->isIncremental() ? "true" : "false");
+	if(_globalWMLimit > 0 && _memory->getWorkingMem().size() > _globalWMLimit && _memory->isIncremental())
 	{
-		ULOGGER_INFO("Working memory size (%d) exceeds GlobalWMLimit (%d), transferring spatially-random nodes to LTM...", 
-			(int)_memory->getWorkingMem().size(), _globalWMLimit);
-		
-		// CUSTOM: Spatially-aware random immunization for GlobalWMLimit
-		std::set<int> immunizedForWMLimit;
-		
-		// Step 1: Always immunize critical nodes to maintain connectivity
-		if(_lastLocalizationNodeId > 0) {
-			immunizedForWMLimit.insert(_lastLocalizationNodeId);
-		}
-		if(_memory->getLastWorkingSignature()) {
-			immunizedForWMLimit.insert(_memory->getLastWorkingSignature()->id());
-		}
-		// Immunize recent loop closure nodes
-		if(_loopClosureHypothesis.first > 0) {
-			immunizedForWMLimit.insert(_loopClosureHypothesis.first);
-		}
-		// Immunize path nodes if any
-		for(unsigned int i = 0; i < _path.size() && i < 5; ++i) { // immunize up to 5 path nodes
-			immunizedForWMLimit.insert(_path[i].first);
-		}
-		
-		// Step 2: Build candidate list for random selection (exclude immunized and recent STM)
-		std::vector<int> candidatesForRemoval;
-		const std::set<int> & stm = _memory->getStMem();
-		for(std::map<int, double>::const_iterator iter = _memory->getWorkingMem().begin(); 
-			iter != _memory->getWorkingMem().end(); ++iter)
+		if(_globalWMLimitRandomRemoval)
 		{
-			if(iter->first > 0 && // valid node
-			   immunizedForWMLimit.find(iter->first) == immunizedForWMLimit.end() && // not immunized
-			   stm.find(iter->first) == stm.end()) // not in STM (too recent)
-			{
-				candidatesForRemoval.push_back(iter->first);
+			ULOGGER_INFO("Working memory size (%d) exceeds GlobalWMLimit (%d), transferring spatially-random nodes to LTM...", 
+				(int)_memory->getWorkingMem().size(), _globalWMLimit);
+			// CUSTOM: Spatially-aware random immunization for GlobalWMLimit
+			std::set<int> immunizedForWMLimit;
+			// Step 1: Always immunize critical nodes to maintain connectivity
+			if(_lastLocalizationNodeId > 0) {
+				immunizedForWMLimit.insert(_lastLocalizationNodeId);
 			}
-		}
-		
-		ULOGGER_INFO("GlobalWMLimit: %d candidates for removal, %d immunized", 
-			(int)candidatesForRemoval.size(), (int)immunizedForWMLimit.size());
-		
-		// Step 3: Random shuffle for spatial distribution
-		if(!candidatesForRemoval.empty())
-		{
-			// Use current signature ID as seed for deterministic randomness
-			std::srand(signature ? signature->id() : (unsigned int)std::time(nullptr));
-			std::random_shuffle(candidatesForRemoval.begin(), candidatesForRemoval.end());
-		}
-		
-		// Step 4: Transfer nodes using random order (Memory::forget will handle link cleanup)
-		int nodesToTransfer = (int)_memory->getWorkingMem().size() - _globalWMLimit;
-		int candidatesUsed = 0;
-		
-		while(_memory->getWorkingMem().size() > _globalWMLimit && nodesToTransfer > 0 && candidatesUsed < (int)candidatesForRemoval.size())
-		{
-			// Build immunization set: keep all except next random candidate
-			std::set<int> immunizeAllExceptCandidate;
-			for(std::map<int, double>::const_iterator iter = _memory->getWorkingMem().begin(); 
-				iter != _memory->getWorkingMem().end(); ++iter)
+			if(_memory->getLastWorkingSignature()) {
+				immunizedForWMLimit.insert(_memory->getLastWorkingSignature()->id());
+			}
+			// Immunize recent loop closure nodes
+			if(_loopClosureHypothesis.first > 0) {
+				immunizedForWMLimit.insert(_loopClosureHypothesis.first);
+			}
+			// Immunize path nodes if any
+			for(unsigned int i = 0; i < _path.size() && i < 5; ++i) {
+				immunizedForWMLimit.insert(_path[i].first);
+			}
+			// Step 2: Build candidate list for random selection (exclude immunized and recent STM)
+			std::vector<int> candidatesForRemoval;
+			const std::set<int> & stm = _memory->getStMem();
+			for(std::map<int, double>::const_iterator iter = _memory->getWorkingMem().begin(); iter != _memory->getWorkingMem().end(); ++iter)
 			{
-				if(iter->first != candidatesForRemoval[candidatesUsed])
+				if(iter->first > 0 && immunizedForWMLimit.find(iter->first) == immunizedForWMLimit.end() && stm.find(iter->first) == stm.end())
 				{
-					immunizeAllExceptCandidate.insert(iter->first);
+					candidatesForRemoval.push_back(iter->first);
 				}
 			}
-			
-			std::list<int> transferred = _memory->forget(immunizeAllExceptCandidate);
-			if(transferred.empty())
+			ULOGGER_INFO("GlobalWMLimit: %d candidates for removal, %d immunized", (int)candidatesForRemoval.size(), (int)immunizedForWMLimit.size());
+			// Step 3: Random shuffle for spatial distribution
+			if(!candidatesForRemoval.empty())
 			{
-				ULOGGER_WARN("Cannot transfer candidate %d from WM (may be connected to STM)", candidatesForRemoval[candidatesUsed]);
+				std::srand(signature ? signature->id() : (unsigned int)std::time(nullptr));
+				std::random_shuffle(candidatesForRemoval.begin(), candidatesForRemoval.end());
+			}
+			// Step 4: Transfer nodes using random order
+			int nodesToTransfer = (int)_memory->getWorkingMem().size() - _globalWMLimit;
+			int candidatesUsed = 0;
+			while(_memory->getWorkingMem().size() > _globalWMLimit && nodesToTransfer > 0 && candidatesUsed < (int)candidatesForRemoval.size())
+			{
+				std::set<int> immunizeAllExceptCandidate;
+				for(std::map<int, double>::const_iterator iter = _memory->getWorkingMem().begin(); iter != _memory->getWorkingMem().end(); ++iter)
+				{
+					if(iter->first != candidatesForRemoval[candidatesUsed])
+					{
+						immunizeAllExceptCandidate.insert(iter->first);
+					}
+				}
+				std::list<int> transferred = _memory->forget(immunizeAllExceptCandidate);
+				if(transferred.empty())
+				{
+					ULOGGER_WARN("Cannot transfer candidate %d from WM (may be connected to STM)", candidatesForRemoval[candidatesUsed]);
+					candidatesUsed++;
+					continue;
+				}
+				explicit_random_transfers += (int)transferred.size();
+				gross_wm_outflow_actual += (int)transferred.size();
+				signaturesRemoved.insert(signaturesRemoved.end(), transferred.begin(), transferred.end());
+				nodesToTransfer -= (int)transferred.size();
 				candidatesUsed++;
-				continue;
+				if(!_someNodesHaveBeenTransferred && transferred.size())
+				{
+					_someNodesHaveBeenTransferred = true;
+				}
+				ULOGGER_INFO("[WMDEBUG] Random transfer batch %d: %d nodes removed, WM size now: %d", candidatesUsed, (int)transferred.size(), (int)_memory->getWorkingMem().size());
 			}
-			
-			signaturesRemoved.insert(signaturesRemoved.end(), transferred.begin(), transferred.end());
-			nodesToTransfer -= (int)transferred.size();
-			candidatesUsed++;
-			
-			if(!_someNodesHaveBeenTransferred && transferred.size())
+			// Update snapshots
+			post_random_wm_size = _memory ? _memory->getWorkingMem().size() : 0;
+			post_random_stm_size = _memory ? _memory->getStMem().size() : 0;
+			// Fallback if needed
+			if(_memory->getWorkingMem().size() > _globalWMLimit)
 			{
-				_someNodesHaveBeenTransferred = true;
+				ULOGGER_WARN("Random selection insufficient, falling back to oldest-first deletion");
+				std::set<int> emptyImmunization;
+				while(_memory->getWorkingMem().size() > _globalWMLimit)
+				{
+					std::list<int> transferred = _memory->forget(emptyImmunization);
+					if(transferred.empty()) break;
+					explicit_oldest_transfers += (int)transferred.size();
+					gross_wm_outflow_actual += (int)transferred.size();
+					ULOGGER_INFO("[WMDEBUG] Oldest-first fallback: %d nodes removed, WM size now: %d", (int)transferred.size(), (int)_memory->getWorkingMem().size());
+					signaturesRemoved.insert(signaturesRemoved.end(), transferred.begin(), transferred.end());
+				}
 			}
-			
-			ULOGGER_DEBUG("Randomly transferred %d nodes to LTM, WM size now: %d", 
-				(int)transferred.size(), (int)_memory->getWorkingMem().size());
+			ULOGGER_INFO("GlobalWMLimit enforcement complete. Final WM size: %d (random removal)", (int)_memory->getWorkingMem().size());
 		}
-		
-		// Fallback: if random selection didn't transfer enough, use original method
-		if(_memory->getWorkingMem().size() > _globalWMLimit)
+		else
 		{
-			ULOGGER_WARN("Random selection insufficient, falling back to oldest-first deletion");
-			std::set<int> emptyImmunization; // No immunization for fallback
-			while(_memory->getWorkingMem().size() > _globalWMLimit && nodesToTransfer > 0)
+			ULOGGER_INFO("Working memory size (%d) exceeds GlobalWMLimit (%d), transferring oldest nodes to LTM...", (int)_memory->getWorkingMem().size(), _globalWMLimit);
+			std::set<int> emptyImmunization;
+			while(_memory->getWorkingMem().size() > _globalWMLimit)
 			{
 				std::list<int> transferred = _memory->forget(emptyImmunization);
 				if(transferred.empty()) break;
-				
+				explicit_oldest_transfers += (int)transferred.size();
+				gross_wm_outflow_actual += (int)transferred.size();
+				ULOGGER_INFO("[WMDEBUG] Oldest-first: %d nodes removed, WM size now: %d", (int)transferred.size(), (int)_memory->getWorkingMem().size());
 				signaturesRemoved.insert(signaturesRemoved.end(), transferred.begin(), transferred.end());
-				nodesToTransfer -= (int)transferred.size();
 			}
 		}
-		
-		ULOGGER_INFO("GlobalWMLimit enforcement complete. Final WM size: %d (used %d random candidates)", 
-			(int)_memory->getWorkingMem().size(), candidatesUsed);
 	}
+	else if(_globalWMLimit > 0 && _memory->getWorkingMem().size() > _globalWMLimit && !_memory->isIncremental())
+	{
+		ULOGGER_INFO("GlobalWMLimit (%d) bypassed in localization mode - keeping all %d nodes in working memory for loop closure detection", 
+			_globalWMLimit, (int)_memory->getWorkingMem().size());
+	}
+
+	// Memory change tracking: capture final state after GlobalWMLimit enforcement
+	int final_wm_size = _memory ? _memory->getWorkingMem().size() : 0;
+	int final_stm_size = _memory ? _memory->getStMem().size() : 0;
+
+	// Compute memory change statistics and add to RTABMap statistics
+	// Export NET changes for STM/WM (final - initial) to reflect true per-frame effect
+	int stm_added = final_stm_size - initial_stm_size;
+	int wm_added = final_wm_size - initial_wm_size;
+	// Export inflows within this frame for visibility even when net is 0
+	int wm_added_from_stm = wm_inflow_from_stm;
+	int wm_added_from_ltm = wm_inflow_from_ltm;
+	
+	// Add to statistics for external access - use explicit counts instead of size deltas
+	statistics_.addStatistic("Memory/STM_added_this_frame", (float)stm_added);
+	statistics_.addStatistic("Memory/WM_added_this_frame", (float)wm_added);
+	statistics_.addStatistic("Memory/WM_regular_removed_this_frame", (float)explicit_time_memory_transfers);
+	statistics_.addStatistic("Memory/WM_random_removed_this_frame", (float)explicit_random_transfers);
+	statistics_.addStatistic("Memory/WM_oldest_removed_this_frame", (float)explicit_oldest_transfers);
+	statistics_.addStatistic("Memory/WM_added_from_stm_this_frame", (float)wm_added_from_stm);
+	statistics_.addStatistic("Memory/WM_added_from_ltm_this_frame", (float)wm_added_from_ltm);
+	
+	// Add gross flow statistics to see actual churn
+	statistics_.addStatistic("Memory/WM_gross_inflow_attempted", (float)gross_wm_inflow_attempted);
+	statistics_.addStatistic("Memory/WM_gross_outflow_actual", (float)gross_wm_outflow_actual);
+	
+	// Comprehensive debug logging 
+	ULOGGER_INFO("[WMDEBUG] WM GROSS FLOWS: attempted_inflow=%d actual_outflow=%d net_change=%d", 
+		gross_wm_inflow_attempted, gross_wm_outflow_actual, wm_added);
+	ULOGGER_INFO("[WMDEBUG] WM sizes: initial=%d post_mem_update=%d post_time_mem=%d post_random=%d final=%d", 
+		initial_wm_size, post_memory_update_wm_size, post_time_memory_transfer_wm_size, 
+		post_random_wm_size, final_wm_size);
+	ULOGGER_INFO("[WMDEBUG] Explicit transfers: time/mem=%d random=%d oldest=%d (limit=%d)", 
+		explicit_time_memory_transfers, explicit_random_transfers, explicit_oldest_transfers, _globalWMLimit);
+	
+	// Verify math: gross_inflow - gross_outflow should equal net WM change
+	int calculated_net = gross_wm_inflow_attempted - gross_wm_outflow_actual;
+	if(calculated_net != wm_added)
+	{
+		ULOGGER_WARN("[WMDEBUG] FLOW MATH MISMATCH: calculated_net=%d != actual_net=%d", 
+			calculated_net, wm_added);
+	}
+
 	timeGlobalWMLimit = timer.ticks();
 	ULOGGER_INFO("timeGlobalWMLimit=%fs", timeGlobalWMLimit);
 
